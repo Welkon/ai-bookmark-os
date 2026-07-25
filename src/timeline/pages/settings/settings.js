@@ -82,6 +82,9 @@ const learningStatsDesc = document.getElementById('learningStatsDesc');
 const viewLearningRecordsBtn = document.getElementById('viewLearningRecordsBtn');
 const clearLearningRecordsBtn = document.getElementById('clearLearningRecordsBtn');
 const learningFeedbackList = document.getElementById('learningFeedbackList');
+const selectAllPendingReviews = document.getElementById('selectAllPendingReviews');
+const pendingReviewSelectionCount = document.getElementById('pendingReviewSelectionCount');
+const confirmSelectedReviewsBtn = document.getElementById('confirmSelectedReviewsBtn');
 const clearReviewQueueBtn = document.getElementById('clearReviewQueueBtn');
 const pendingReviewsList = document.getElementById('pendingReviewsList');
 const recommendationRuleTabs = document.getElementById('recommendationRuleTabs');
@@ -90,6 +93,7 @@ const undoRecommendationLearningBtn = document.getElementById('undoRecommendatio
 const rebuildRecommendationLearningBtn = document.getElementById('rebuildRecommendationLearningBtn');
 const reevaluateBookmarksBtn = document.getElementById('reevaluateBookmarksBtn');
 const reevaluationResults = document.getElementById('reevaluationResults');
+const aboutVersion = document.getElementById('aboutVersion');
 
 // ===== 通知设置 DOM 引用 =====
 const notificationEnabledToggle = document.getElementById('notificationEnabledToggle');
@@ -2813,6 +2817,7 @@ function bindTreeSettings() {
 
 
 document.addEventListener('DOMContentLoaded', async () => {
+  aboutVersion.textContent = chrome.runtime.getManifest().version;
   loadTheme();
   await loadLanguage();
   loadCheckerSettings();
@@ -3113,6 +3118,9 @@ let reevaluationSelected = new Set();
 let reevaluationCancelled = false;
 let reevaluationApplying = false;
 let learningFeedbackExpanded = false;
+let pendingReviewQueue = [];
+let pendingReviewSelected = new Set();
+let pendingReviewBatching = false;
 
 function makeSettingsOperationId(prefix) {
   return `${prefix}_${globalThis.crypto?.randomUUID?.() || `${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`}`;
@@ -3522,14 +3530,21 @@ function renderLearningFeedback(records) {
 }
 
 function renderPendingReviews(queue) {
-  if (!queue || queue.length === 0) {
+  pendingReviewQueue = Array.isArray(queue) ? queue : [];
+  const confirmableIds = new Set(pendingReviewQueue.filter(isPendingReviewConfirmable).map(item => item.id));
+  pendingReviewSelected = new Set([...pendingReviewSelected].filter(id => confirmableIds.has(id)));
+
+  if (pendingReviewQueue.length === 0) {
     pendingReviewsList.innerHTML = `<div class="tagrule-empty">${i18n('noPendingReviews') || '暂无待确认的书签'}</div>`;
+    updatePendingReviewSelectionControls();
     return;
   }
 
-  pendingReviewsList.innerHTML = queue.map(item => {
+  pendingReviewsList.innerHTML = pendingReviewQueue.map(item => {
+    const selectionControl = renderPendingReviewSelection(item);
     if (item.type === 'move_observation') {
       return `<div class="review-item review-item--observation" data-id="${escapeHtml(item.id)}">
+        ${selectionControl}
         <div class="review-info">
           <div class="review-title">${escapeHtml(item.title || item.bookmarkId)}</div>
           <div class="review-meta"><span class="review-reason">移动待复核</span><span>来源待确认</span></div>
@@ -3549,6 +3564,7 @@ function renderPendingReviews(queue) {
       const folderCandidates = folders.map((candidate, index) => `<span class="review-candidate"><b>${index + 1}</b><span class="review-candidate-label">${escapeHtml(candidate.folderPath || '未知目录')}</span><small>${recommendationConfidenceText(candidate.confidence)}</small></span>`).join('');
       const tagCandidates = tags.map((candidate, index) => `<span class="review-candidate"><b>${index + 1}</b><span class="review-candidate-label">#${escapeHtml(candidate.tag)}</span><small>${recommendationConfidenceText(candidate.confidence)}</small></span>`).join('');
       return `<div class="review-item review-item--recommendation" data-id="${escapeHtml(item.id)}">
+        ${selectionControl}
         <div class="review-info">
           <div class="review-title">${escapeHtml(item.title || item.bookmarkId)}</div>
           <div class="review-meta"><span class="review-reason">智能分类建议</span><span class="review-confidence">${recommendationConfidenceText(item.confidence)}</span>${item.aiTriggered ? '<span class="review-source review-source--ai">AI 辅助</span>' : ''}</div>
@@ -3571,6 +3587,7 @@ function renderPendingReviews(queue) {
       : '';
     return `
     <div class="review-item ${isAI ? 'review-item--ai' : ''}" data-id="${escapeHtml(item.id)}">
+      ${selectionControl}
       <div class="review-info">
         <div class="review-title" title="${escapeHtml(item.url)}">${escapeHtml(item.title || item.url)}</div>
         <div class="review-meta">
@@ -3599,6 +3616,13 @@ function renderPendingReviews(queue) {
     </div>
   `}).join('');
 
+  pendingReviewsList.querySelectorAll('.pending-review-checkbox').forEach(checkbox => {
+    checkbox.addEventListener('change', () => {
+      if (checkbox.checked) pendingReviewSelected.add(checkbox.dataset.id);
+      else pendingReviewSelected.delete(checkbox.dataset.id);
+      updatePendingReviewSelectionControls();
+    });
+  });
   pendingReviewsList.querySelectorAll('.review-confirm').forEach(btn => {
     btn.addEventListener('click', () => onConfirmReview(btn.dataset.id, false));
   });
@@ -3614,6 +3638,52 @@ function renderPendingReviews(queue) {
       button.dataset.decision,
     ));
   });
+  updatePendingReviewSelectionControls();
+}
+
+function isPendingReviewConfirmable(item) {
+  if (item?.type === 'move_observation') return !!item.recommendation;
+  if (item?.type !== 'bookmark_recommendation') return true;
+  const recommendation = item.recommendation;
+  return !!(recommendation?.folders?.[0]?.existing && recommendation.folders[0].id)
+    || !!recommendation?.tags?.[0]?.tag;
+}
+
+function renderPendingReviewSelection(item) {
+  const checked = pendingReviewSelected.has(item.id) ? 'checked' : '';
+  const disabled = isPendingReviewConfirmable(item) ? '' : 'disabled';
+  const label = i18n('selectPendingReview', [item.title || item.bookmarkId || item.url || '']);
+  return `<label class="pending-review-item-select">
+    <input class="pending-review-checkbox" type="checkbox" data-id="${escapeHtml(item.id)}" aria-label="${escapeHtml(label)}" ${checked} ${disabled}>
+  </label>`;
+}
+
+function updatePendingReviewSelectionControls() {
+  const selectable = [...pendingReviewsList.querySelectorAll('.pending-review-checkbox:not(:disabled)')];
+  const selectedCount = selectable.filter(checkbox => checkbox.checked).length;
+  selectAllPendingReviews.checked = selectable.length > 0 && selectedCount === selectable.length;
+  selectAllPendingReviews.indeterminate = selectedCount > 0 && selectedCount < selectable.length;
+  selectAllPendingReviews.disabled = pendingReviewBatching || selectable.length === 0;
+  pendingReviewSelectionCount.textContent = i18n('pendingReviewSelectionCount', [selectedCount]);
+  confirmSelectedReviewsBtn.textContent = selectedCount > 0
+    ? i18n('confirmSelectedReviewsCount', [selectedCount])
+    : i18n('confirmSelectedReviews');
+  confirmSelectedReviewsBtn.disabled = pendingReviewBatching || selectedCount === 0;
+  clearReviewQueueBtn.disabled = pendingReviewBatching;
+}
+
+function setPendingReviewControlsDisabled(disabled) {
+  pendingReviewsList.querySelectorAll('button, input').forEach(control => {
+    if (disabled) {
+      control.dataset.pendingReviewWasDisabled = String(control.disabled);
+      control.disabled = true;
+      return;
+    }
+    if (control.dataset.pendingReviewWasDisabled !== undefined) {
+      control.disabled = control.dataset.pendingReviewWasDisabled === 'true';
+      delete control.dataset.pendingReviewWasDisabled;
+    }
+  });
 }
 
 function recommendationConfidenceText(value) {
@@ -3623,14 +3693,18 @@ function recommendationConfidenceText(value) {
 async function onResolveRecommendationReview(reviewId, decision) {
   if (!reviewId || !decision) return;
   if (decision === 'accept' && !confirm('确认采用此项并用于后续推荐学习吗？')) return;
-  const result = await chrome.runtime.sendMessage({
+  const result = await resolveRecommendationReview(reviewId, decision);
+  showToast(result?.success ? '待复核项已处理' : `处理失败：${result?.error || 'unknown'}`, result?.success ? 'success' : 'error');
+  await loadActiveLearning();
+}
+
+function resolveRecommendationReview(reviewId, decision) {
+  return chrome.runtime.sendMessage({
     action: 'resolveRecommendationReview',
     operationId: makeSettingsOperationId('resolve_review'),
     reviewId,
     decision,
   }).catch(() => null);
-  showToast(result?.success ? '待复核项已处理' : `处理失败：${result?.error || 'unknown'}`, result?.success ? 'success' : 'error');
-  await loadActiveLearning();
 }
 
 function getReasonText(reason) {
@@ -3657,18 +3731,11 @@ async function onConfirmReview(id, isModify) {
 
     const input = pendingReviewsList.querySelector(`.review-item[data-id="${CSS.escape(id)}"] .review-tag-input`);
     const tag = input ? input.value.trim() : ((item.suggestedTags || [])[0] || '');
-    if (!tag) {
-      showToast(i18n('fillAllFields') || '请填写标签', 'error');
+    const result = await confirmLegacyReview(item, tag, isModify);
+    if (!result?.success) {
+      showToast(result?.error === 'missing_tag' ? (i18n('fillAllFields') || '请填写标签') : i18n('saveFailed'), 'error');
       return;
     }
-
-    await chrome.runtime.sendMessage({
-      action: 'confirmTagReview',
-      operationId: makeSettingsOperationId('legacy_review'),
-      queueItem: item,
-      confirmedTags: [tag],
-      reviewAction: isModify ? 'modified' : 'accepted'
-    });
 
     await loadActiveLearning();
     showToast(i18n('settingsSaved'), 'success');
@@ -3676,6 +3743,67 @@ async function onConfirmReview(id, isModify) {
     // 静默处理
   }
 }
+
+function confirmLegacyReview(item, tag, isModify) {
+  if (!tag) return Promise.resolve({ success: false, error: 'missing_tag' });
+  return chrome.runtime.sendMessage({
+    action: 'confirmTagReview',
+    operationId: makeSettingsOperationId('legacy_review'),
+    queueItem: item,
+    confirmedTags: [tag],
+    reviewAction: isModify ? 'modified' : 'accepted'
+  }).catch(() => null);
+}
+
+selectAllPendingReviews?.addEventListener('change', () => {
+  const checkboxes = [...pendingReviewsList.querySelectorAll('.pending-review-checkbox:not(:disabled)')];
+  for (const checkbox of checkboxes) {
+    checkbox.checked = selectAllPendingReviews.checked;
+    if (checkbox.checked) pendingReviewSelected.add(checkbox.dataset.id);
+    else pendingReviewSelected.delete(checkbox.dataset.id);
+  }
+  updatePendingReviewSelectionControls();
+});
+
+confirmSelectedReviewsBtn?.addEventListener('click', async () => {
+  if (pendingReviewBatching) return;
+  const selectedReviews = pendingReviewQueue
+    .filter(item => pendingReviewSelected.has(item.id) && isPendingReviewConfirmable(item))
+    .map(item => ({
+      item,
+      tag: pendingReviewsList.querySelector(`.review-item[data-id="${CSS.escape(item.id)}"] .review-tag-input`)?.value.trim() || '',
+    }));
+  if (selectedReviews.length === 0) return;
+  if (!confirm(i18n('confirmSelectedReviewsPrompt', [selectedReviews.length]))) return;
+
+  pendingReviewBatching = true;
+  updatePendingReviewSelectionControls();
+  setPendingReviewControlsDisabled(true);
+  let succeeded = 0;
+  let failed = 0;
+  for (const { item, tag } of selectedReviews) {
+    const result = item.type === 'bookmark_recommendation' || item.type === 'move_observation'
+      ? await resolveRecommendationReview(item.id, 'accept')
+      : await confirmLegacyReview(item, tag, false);
+    if (result?.success) {
+      succeeded += 1;
+      pendingReviewSelected.delete(item.id);
+    } else {
+      failed += 1;
+    }
+  }
+
+  await loadActiveLearning();
+  pendingReviewBatching = false;
+  setPendingReviewControlsDisabled(false);
+  updatePendingReviewSelectionControls();
+  showToast(
+    failed > 0
+      ? i18n('batchConfirmReviewsPartial', [succeeded, failed])
+      : i18n('batchConfirmReviewsSuccess', [succeeded]),
+    failed > 0 ? 'error' : 'success',
+  );
+});
 
 async function onIgnoreReview(id) {
   try {

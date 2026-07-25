@@ -1358,6 +1358,46 @@ body.theme-dark .conflict-details .conflict-item kbd {
   gap: 8px;
 }
 
+.pending-review-toolbar,
+.pending-review-select-all {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.pending-review-toolbar {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.pending-review-select-all {
+  min-height: 28px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.pending-review-select-all:has(input:disabled) {
+  cursor: default;
+  opacity: 0.55;
+}
+
+.pending-review-select-all input,
+.pending-review-checkbox {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.pending-review-selection-count {
+  min-width: 68px;
+  color: var(--text-tertiary);
+  font-size: 12px;
+  text-align: right;
+  white-space: nowrap;
+}
+
 .learning-feedback-list {
   display: grid;
   gap: 8px;
@@ -1435,12 +1475,25 @@ body.theme-dark .conflict-details .conflict-item kbd {
 }
 
 .review-item {
+  position: relative;
   display: flex;
   flex-direction: column;
   gap: 10px;
-  padding: 12px;
+  padding: 12px 12px 12px 42px;
   border-radius: var(--radius-md);
   background: var(--bg-secondary);
+}
+
+.pending-review-item-select {
+  position: absolute;
+  top: 14px;
+  left: 14px;
+  display: inline-flex;
+  align-items: center;
+}
+
+.pending-review-item-select:has(input:disabled) {
+  opacity: 0.45;
 }
 
 .review-info {

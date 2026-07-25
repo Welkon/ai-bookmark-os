@@ -1310,9 +1310,15 @@ function testUiContracts() {
   assert.match(settingsStyle, /html\.i18n-pending\s+body\s*\{[^}]*visibility:\s*hidden/, '语言待加载状态不得显示英文回退文案');
   assert.match(settingsScript, /finally\s*\{\s*document\.documentElement\.classList\.remove\(['"]i18n-pending['"]\)/, '语言读取成功或失败后都必须恢复页面显示');
   assert.match(settingsScript, /DOMContentLoaded['"],\s*async[\s\S]{0,120}await\s+loadLanguage\(\)/, '设置页其余面板应在语言应用后初始化');
+  assert.match(settings, /class=["']about-version["'][^>]*>[\s\S]{0,120}id=["']aboutVersion["']/, '关于页必须提供动态版本号容器');
+  assert.match(settingsScript, /aboutVersion\.textContent\s*=\s*chrome\.runtime\.getManifest\(\)\.version/, '关于页版本号必须读取扩展 Manifest');
+  assert.doesNotMatch(settings, /1\.0\.3/, '关于页不得保留过期的硬编码版本号');
   assert.match(settings, /id=["']learningFeedbackList["']/, '学习统计必须提供反馈记录明细容器');
   assert.match(settings, /id=["']clearLearningRecordsBtn["']/, '学习统计必须提供独立的学习记录清理入口');
   assert.match(settings, /id=["']clearReviewQueueBtn["'][\s\S]{0,100}clearQueue/, '待复核列表必须提供语义明确的队列清理入口');
+  assert.match(settings, /id=["']selectAllPendingReviews["'][\s\S]{0,300}id=["']confirmSelectedReviewsBtn["']/, '待复核列表必须提供全选和确认所选入口');
+  assert.match(settingsScript, /pendingReviewSelected\s*=\s*new Set[\s\S]{0,8000}\.pending-review-checkbox[\s\S]{0,800}updatePendingReviewSelectionControls/, '待复核列表必须同步逐项选择和全选状态');
+  assert.match(settingsScript, /confirmSelectedReviewsBtn\?\.addEventListener[\s\S]{0,1800}resolveRecommendationReview\(item\.id,\s*['"]accept['"]\)[\s\S]{0,200}confirmLegacyReview\(item,\s*tag,\s*false\)/, '批量确认必须复用新版与旧版单条确认协议');
   assert.match(settingsScript, /recommendationLearningState\?\.recentFeedback/, '设置页必须渲染后台返回的最近反馈');
   assert.match(settingsScript, /accepted:\s*['"]learningRecordAccepted['"][\s\S]{0,180}rejected:\s*['"]learningRecordRejected['"][\s\S]{0,100}cancelled:\s*['"]learningRecordCancelled['"]/, '学习记录必须区分接受、拒绝和取消');
   assert.match(settingsScript, /action:\s*['"]clearRecommendationLearning['"]/, '清空学习记录必须走独立后台 mutation');

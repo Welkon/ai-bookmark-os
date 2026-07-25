@@ -127,6 +127,9 @@ try {
     await chrome.bookmarks.create({ parentId: folder.id, title: 'Synthetic Design', url: 'https://example.test/design' });
     await chrome.bookmarks.create({ parentId: folder.id, title: 'Synthetic Operations', url: 'https://example.test/ops' });
     await chrome.bookmarks.create({ parentId: folder.id, title: 'Synthetic Healthy Link', url: `http://127.0.0.1:${fixturePort}/health-check` });
+    const reviewTargetFolder = await chrome.bookmarks.create({ parentId: bar.id, title: 'E2E Batch Target' });
+    const reviewBookmarkOne = await chrome.bookmarks.create({ parentId: folder.id, title: 'Synthetic Batch One', url: 'https://batch.example/one' });
+    const reviewBookmarkTwo = await chrome.bookmarks.create({ parentId: folder.id, title: 'Synthetic Batch Two', url: 'https://batch.example/two' });
     await chrome.storage.local.set({
       ai_classifier_config: {
         enabled: true,
@@ -156,6 +159,7 @@ try {
     });
     await syncAllBookmarks();
     await syncAllBookmarks();
+    await clearReviewQueue();
     const timeline = await chrome.storage.local.get('bookmark_timeline_data');
     const bookmarks = timeline.bookmark_timeline_data || [];
     if (!bookmarks.length) throw new Error('synthetic bookmarks were not mirrored');
@@ -170,6 +174,44 @@ try {
       contentHeadings: ['Private heading'],
     };
     const now = Date.now();
+    const reviewTarget = (await loadBookmarkFolderOptions()).find(item => item.id === reviewTargetFolder.id);
+    if (!reviewTarget) throw new Error('batch review target folder was not indexed');
+    const reviewNativeBookmarks = [reviewBookmarkOne, reviewBookmarkTwo];
+    const reviewMirroredBookmarks = reviewNativeBookmarks.map((nativeBookmark) => {
+      const bookmark = bookmarks.find(item => item.id === nativeBookmark.id);
+      if (!bookmark) throw new Error(`batch review bookmark was not mirrored: ${nativeBookmark.id}`);
+      bookmark.tags = [];
+      bookmark.tagsAuto = [];
+      return bookmark;
+    });
+    const reviewSnapshots = reviewMirroredBookmarks.map((bookmark, index) => ({
+      recommendationId: `recommendation-e2e-batch-${index + 1}`,
+      ruleVersion: 'bookmark-recommendation-v3',
+      urlFingerprint: recommendationUrlFingerprint(bookmark.url),
+      domain: 'batch.example',
+      pathSegments: [index === 0 ? 'one' : 'two'],
+      tags: [{ tag: 'E2E Batch Tag', support: 0.95, confidence: 'high' }],
+      folders: [{ id: reviewTarget.id, folderPath: reviewTarget.path, existing: true, support: 0.95, confidence: 'high' }],
+      selectedTags: ['E2E Batch Tag'],
+      selectedFolderPath: reviewTarget.path,
+      createdAt: now,
+    }));
+    const reviewQueue = reviewMirroredBookmarks.map((bookmark, index) => ({
+      id: `review-e2e-batch-${index + 1}`,
+      type: 'bookmark_recommendation',
+      bookmarkId: bookmark.id,
+      recommendationId: reviewSnapshots[index].recommendationId,
+      title: bookmark.title,
+      urlFingerprint: reviewSnapshots[index].urlFingerprint,
+      fromFolderPath: bookmark.folderPath,
+      toFolderId: reviewTarget.id,
+      toFolderPath: reviewTarget.path,
+      sourceParentId: bookmark.parentId,
+      sourceTags: [],
+      confidence: 'high',
+      createdAt: now,
+      updatedAt: now,
+    }));
     await chrome.storage.local.set({
       bookmark_timeline_data: bookmarks,
       tag_colors: { 'E2E Unified Tag': '#123456' },
@@ -217,8 +259,8 @@ try {
         migratedAt: now,
         rules: [],
         stopWords: [],
-        snapshots: [],
-        reviewQueue: [],
+        snapshots: reviewSnapshots,
+        reviewQueue,
         feedback: [
           {
             id: 'feedback-e2e-rejected',
@@ -295,16 +337,73 @@ try {
   await settings.keyboard.press('Tab');
   assert.equal(await settings.evaluate(() => document.activeElement?.matches('button, input, select, textarea, a[href]')), true, 'keyboard focus did not reach an interactive control');
 
-  await settings.locator('[data-panel="activelearning"]').click();
-  await settings.locator('#panel-activelearning').waitFor({ state: 'visible' });
-  assert.equal(await settings.locator('#recommendationRuleTabs [role="tab"]').count(), 4);
-  await settings.locator('#viewLearningRecordsBtn').click();
-  assert.equal(await settings.locator('#learningFeedbackList .learning-feedback-item').count(), 2);
+    await settings.locator('[data-panel="activelearning"]').click();
+    await settings.locator('#panel-activelearning').waitFor({ state: 'visible' });
+    assert.equal(await settings.locator('#recommendationRuleTabs [role="tab"]').count(), 4);
+    const pendingReviewCheckboxes = settings.locator('#pendingReviewsList .pending-review-checkbox:not(:disabled)');
+    const batchReviewCheckboxes = settings.locator('#pendingReviewsList .review-item[data-id^="review-e2e-batch-"] .pending-review-checkbox:not(:disabled)');
+    assert.equal(await batchReviewCheckboxes.count(), 2, 'batch review fixtures were not rendered as selectable');
+    assert.equal(await settings.locator('#confirmSelectedReviewsBtn').isDisabled(), true);
+    await batchReviewCheckboxes.first().check();
+    assert.match(await settings.locator('#pendingReviewSelectionCount').innerText(), /1/);
+    assert.equal(await settings.locator('#selectAllPendingReviews').evaluate(element => element.indeterminate), true);
+    await settings.locator('#selectAllPendingReviews').check();
+    assert.equal(await pendingReviewCheckboxes.evaluateAll(elements => elements.every(element => element.checked)), true);
+    await batchReviewCheckboxes.last().uncheck();
+    assert.equal(await settings.locator('#selectAllPendingReviews').evaluate(element => element.indeterminate), true);
+    await settings.locator('#selectAllPendingReviews').check();
+    const unrelatedReviewCheckboxes = settings.locator('#pendingReviewsList .review-item:not([data-id^="review-e2e-batch-"]) .pending-review-checkbox:not(:disabled)');
+    for (let index = 0; index < await unrelatedReviewCheckboxes.count(); index++) {
+      await unrelatedReviewCheckboxes.nth(index).uncheck();
+    }
+    assert.match(await settings.locator('#confirmSelectedReviewsBtn').innerText(), /2/);
+    await settings.screenshot({ path: join(artifactsPath, 'learning-batch-selection.png'), fullPage: true });
+    settings.once('dialog', dialog => dialog.accept());
+    await settings.locator('#confirmSelectedReviewsBtn').click();
+    await settings.locator('.toast').filter({ hasText: /已批量确认 2 条书签|2 bookmarks confirmed/i }).waitFor({ timeout: 10000 });
+    await settings.locator('#pendingReviewsList .review-item[data-id^="review-e2e-batch-"]').waitFor({ state: 'detached', timeout: 10000 });
+    const batchResult = await worker.evaluate(async () => {
+      const tree = await chrome.bookmarks.getTree();
+      const allNodes = [];
+      const walk = (nodes) => {
+        for (const node of nodes || []) {
+          allNodes.push(node);
+          walk(node.children);
+        }
+      };
+      walk(tree);
+      const target = allNodes.find(node => !node.url && node.title === 'E2E Batch Target');
+      const moved = allNodes.filter(node => ['Synthetic Batch One', 'Synthetic Batch Two'].includes(node.title));
+      const stored = (await chrome.storage.local.get(['bookmark_timeline_data', 'bookmark_recommendation_store_v2']));
+      const mirrored = (stored.bookmark_timeline_data || []).filter(item => ['Synthetic Batch One', 'Synthetic Batch Two'].includes(item.title));
+      return {
+        targetId: target?.id || '',
+        movedParentIds: moved.map(item => item.parentId),
+        mirrored: mirrored.map(item => ({ parentId: item.parentId, tags: item.tags || [] })),
+        remainingFixtureReviewIds: (stored.bookmark_recommendation_store_v2?.reviewQueue || [])
+          .filter(item => item.id.startsWith('review-e2e-batch-'))
+          .map(item => item.id),
+        accepted: stored.bookmark_recommendation_store_v2?.stats?.accepted,
+      };
+    });
+    assert.ok(batchResult.targetId);
+    assert.deepEqual(batchResult.movedParentIds, [batchResult.targetId, batchResult.targetId]);
+    assert.equal(batchResult.mirrored.length, 2);
+    assert.equal(batchResult.mirrored.every(item => item.parentId === batchResult.targetId && item.tags.includes('E2E Batch Tag')), true);
+    assert.deepEqual(batchResult.remainingFixtureReviewIds, []);
+    assert.equal(batchResult.accepted, 2);
+    await settings.locator('#viewLearningRecordsBtn').click();
+    assert.equal(await settings.locator('#learningFeedbackList .learning-feedback-item').count(), 4);
   const learningFeedbackText = await settings.locator('#learningFeedbackList').innerText();
   assert.match(learningFeedbackText, /rejected\.example[\s\S]*(拒绝|Rejected)/i);
   assert.match(learningFeedbackText, /cancelled\.example[\s\S]*(取消|Cancelled)/i);
-  assert.doesNotMatch(learningFeedbackText, /https?:\/\//i, 'learning feedback details must not expose original URLs');
-  await settings.locator('#reevaluateBookmarksBtn').click();
+    assert.doesNotMatch(learningFeedbackText, /https?:\/\//i, 'learning feedback details must not expose original URLs');
+    await settings.locator('[data-panel="about"]').click();
+    await settings.locator('#panel-about').waitFor({ state: 'visible' });
+    assert.equal(await settings.locator('#aboutVersion').innerText(), await worker.evaluate(() => chrome.runtime.getManifest().version));
+    await settings.locator('[data-panel="activelearning"]').click();
+    await settings.locator('#panel-activelearning').waitFor({ state: 'visible' });
+    await settings.locator('#reevaluateBookmarksBtn').click();
   await settings.locator('#reevaluationResults').filter({ hasText: /评估完成|Evaluation complete/i }).waitFor({ timeout: 15000 });
   await settings.locator('.review-item--recommendation').first().waitFor({ state: 'visible', timeout: 10000 });
   assert.equal(await settings.locator('#reevaluationResults .reevaluation-select input').count(), 0, 'medium-confidence reevaluation items must not be preselected');
