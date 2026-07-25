@@ -360,10 +360,7 @@ const SIGNAL_WEIGHTS = {
   prototypeBm25: 14,
 
   // 图推理层（异步场景）
-  siblingPropagation: 20,
-  temporalCluster: 12,
-  domainCooccurrence: 10,
-
+  temporalCluster: 12,
   // AI 增强层
   ai: 45,
 
@@ -743,9 +740,6 @@ const USER_OVERRIDES_KEY = 'tag_user_overrides';
 const TAG_COLORS_KEY = 'tag_colors';
 const DOC_FREQ_KEY = 'tag_doc_frequency'; // TF-IDF 文档频率存储
 const DOC_PROCESSED_URLS_KEY = 'tag_doc_processed_urls'; // 已统计过的文档 URL
-const CONTENT_CACHE_KEY = 'tag_content_cache'; // 已提取正文缓存
-const CONTENT_CACHE_TTL = 7 * 24 * 60 * 60 * 1000; // 7 天
-const CONTENT_CACHE_MAX = 300; // 最大缓存条数
 
 // ===== 同义词库（术语归一化） =====
 const SYNONYM_GROUPS = [
@@ -1065,50 +1059,12 @@ function computeTfIdfScores(text, df, totalDocs, totalTokenLen) {
   return scores;
 }
 
-// ===== 正文内容缓存 =====
-async function getCachedContent(url) {
-  if (!url) return null;
-  try {
-    const result = await chrome.storage.local.get(CONTENT_CACHE_KEY);
-    const cache = result[CONTENT_CACHE_KEY] || {};
-    const hit = cache[url];
-    if (!hit) return null;
-    if (Date.now() - hit.ts > CONTENT_CACHE_TTL) return null;
-    return hit.data || null;
-  } catch {
-    return null;
-  }
-}
-
-async function setCachedContent(url, data) {
-  if (!url || !data) return;
-  try {
-    const result = await chrome.storage.local.get(CONTENT_CACHE_KEY);
-    const cache = result[CONTENT_CACHE_KEY] || {};
-    const trimmed = {
-      title: (data.title || '').slice(0, 200),
-      excerpt: (data.excerpt || data.metaDesc || '').slice(0, 500),
-      textContent: (data.textContent || '').slice(0, 3000),
-      metaDesc: (data.metaDesc || '').slice(0, 500),
-      lengthChars: data.lengthChars || (data.textContent || '').length
-    };
-    cache[url] = { data: trimmed, ts: Date.now() };
-    // 清理过期 + 限制条数
-    const valid = Object.entries(cache)
-      .filter(([_, v]) => Date.now() - v.ts < CONTENT_CACHE_TTL)
-      .sort((a, b) => b[1].ts - a[1].ts)
-      .slice(0, CONTENT_CACHE_MAX);
-    await chrome.storage.local.set({ [CONTENT_CACHE_KEY]: Object.fromEntries(valid) });
-  } catch {
-    // 缓存失败不影响主流程
-  }
-}
-
 // 归一化置信度到 0-1 范围（使用固定参考值，避免 top1 永远为 1.0）
 function normalizeConfidence(score) {
   // 增强后信号层增多，参考最大值相应提升，避免置信度长期顶格
   const REFERENCE_MAX = 180;
-  return Math.min(score / REFERENCE_MAX, 1.0);
+  // 负分（贝叶斯反向分）不应产出负置信度并透出到 UI。
+  return Math.min(Math.max(score, 0) / REFERENCE_MAX, 1.0);
 }
 
 // 判断标签是否有强规则信号（文件夹/域名/用户覆盖）
@@ -1157,7 +1113,9 @@ function applyConfidenceFilter(sortedEntries, signals) {
 
   // 强规则信号下提高阈值，避免内容噪声产生过多副标签拉低精确匹配率
   const ratio = hasStrongSignal(signals, top1Tag) ? 0.65 : 0.45;
-  const relativeThreshold = top1Score * ratio;
+  // top1 为负分时（贝叶斯反向分可把弱正分压到 0 以下）按比例缩放会让阈值反而高于 top1，
+  // 把 top1 自己也过滤掉并让 direct 分支返回空标签。此时以 top1 自身作为阈值。
+  const relativeThreshold = top1Score > 0 ? top1Score * ratio : top1Score;
   const filtered = sortedEntries.filter(([_, score]) => score >= relativeThreshold);
 
   return filtered.slice(0, 3);
@@ -1478,6 +1436,15 @@ function computePrototypeBm25Scores(text, prototypes) {
 
   const numPrototypes = Object.keys(prototypes).length || 1;
 
+  // 文档频率：该 term 出现在多少个原型里。缺了这一步 idf 的分子分母都不含 term，
+  // 对所有 term 恒为同一常量，本层就退化成纯词频重叠、失去区分度。
+  const docFreq = new Map();
+  for (const protoTokens of Object.values(prototypeTokens)) {
+    for (const term of new Set(protoTokens)) {
+      docFreq.set(term, (docFreq.get(term) || 0) + 1);
+    }
+  }
+
   for (const [tag, protoTokens] of Object.entries(prototypeTokens)) {
     if (protoTokens.length === 0) continue;
     const protoFreq = termFrequency(protoTokens);
@@ -1487,7 +1454,8 @@ function computePrototypeBm25Scores(text, prototypes) {
     for (const [term, freq] of tf) {
       if (!protoFreq.has(term)) continue;
       const protoTf = protoFreq.get(term);
-      const idf = Math.log((numPrototypes - 1 + 0.5) / (1 + 0.5) + 1);
+      const df = docFreq.get(term) || 1;
+      const idf = Math.log((numPrototypes - df + 0.5) / (df + 0.5) + 1);
       const tfSat = (protoTf * 2.2) / (protoTf + 1.2 * (1 - 0.75 + 0.75 * protoLen / 50));
       score += tfSat * idf * (freq / tokens.length);
     }
@@ -1536,34 +1504,6 @@ function scoreContentFingerprint(fingerprint, salientText = '') {
 }
 
 // ===== 图关系推理（异步场景） =====
-async function inferTagsFromSiblings(bookmarkId, folderId) {
-  if (!folderId || typeof chrome === 'undefined' || !chrome.bookmarks) return {};
-  try {
-    const siblings = await chrome.bookmarks.getChildren(folderId);
-    const tagVotes = {};
-    let taggedCount = 0;
-    for (const sibling of siblings) {
-      if (sibling.id === bookmarkId || !sibling.url) continue;
-      const stored = await chrome.storage.local.get(`tags_${sibling.id}`);
-      const tags = stored[`tags_${sibling.id}`] || [];
-      if (tags.length === 0) continue;
-      taggedCount += 1;
-      for (const tag of tags) {
-        tagVotes[tag] = (tagVotes[tag] || 0) + 1;
-      }
-    }
-    if (taggedCount < 2) return {};
-    const scores = {};
-    for (const [tag, count] of Object.entries(tagVotes)) {
-      const ratio = count / taggedCount;
-      if (ratio >= 0.7) scores[tag] = 25;
-      else if (ratio >= 0.4) scores[tag] = 15;
-    }
-    return scores;
-  } catch {
-    return {};
-  }
-}
 
 async function inferTagsFromTemporalCluster(url, addTime) {
   if (!url || typeof chrome === 'undefined' || !chrome.history) return {};
@@ -1604,42 +1544,7 @@ function extractHostname(url) {
   }
 }
 
-const DOMAIN_COOCUR_KEY = 'tag_domain_cooccurrence';
 
-async function learnDomainCooccurrence(domain1, domain2) {
-  if (!domain1 || !domain2 || domain1 === domain2) return;
-  if (typeof chrome === 'undefined' || !chrome.storage) return;
-  try {
-    const data = await chrome.storage.local.get(DOMAIN_COOCUR_KEY);
-    const matrix = data[DOMAIN_COOCUR_KEY] || {};
-    const d1 = domain1.toLowerCase();
-    const d2 = domain2.toLowerCase();
-    if (!matrix[d1]) matrix[d1] = {};
-    matrix[d1][d2] = (matrix[d1][d2] || 0) + 1;
-    await chrome.storage.local.set({ [DOMAIN_COOCUR_KEY]: matrix });
-  } catch {
-    // ignore
-  }
-}
-
-async function getDomainCooccurrenceTags(domain, knownTags) {
-  if (!domain || typeof chrome === 'undefined' || !chrome.storage) return {};
-  try {
-    const data = await chrome.storage.local.get(DOMAIN_COOCUR_KEY);
-    const matrix = data[DOMAIN_COOCUR_KEY] || {};
-    const row = matrix[domain.toLowerCase()] || {};
-    const scores = {};
-    for (const [otherDomain, count] of Object.entries(row)) {
-      const match = matchDomainTag(otherDomain);
-      if (match && knownTags.includes(match.tag)) {
-        scores[match.tag] = (scores[match.tag] || 0) + Math.log(count + 1) * 4;
-      }
-    }
-    return scores;
-  } catch {
-    return {};
-  }
-}
 
 // ===== 从标题提取标签（正则 + 关键词双层匹配） =====
 function extractTagsFromTitle(title) {
@@ -1651,12 +1556,16 @@ function extractTagsFromTitle(title) {
   const scores = {};
   const signals = {}; // tag -> string[] 信号来源追踪
 
-  function addScore(tag, score, signal) {
+  // 可变参数：标题层会一次传入 regex/keyword/fuzzy/ngram 多个信号，全部保留。
+  // 只留第一个会让仅靠 fuzzy 首次命中的标签失去 direct 资格（见 hasDirectLocalSignal）。
+  function addScore(tag, score, ...signalList) {
     tag = canonicalCategoryTag(tag);
     if (!tag) return;
     scores[tag] = (scores[tag] || 0) + score;
     if (!signals[tag]) signals[tag] = [];
-    signals[tag].push(signal);
+    for (const item of signalList) {
+      if (item !== undefined) signals[tag].push(item);
+    }
   }
 
   // Layer 1: 正则精准匹配（高分）
@@ -1852,20 +1761,27 @@ function matchCombinationRules(features) {
   return hits;
 }
 
+// 域名与规则域名是否匹配：严格后缀语义（host === rule 或 host 以 .rule 结尾）。
+// 命中判定、自动学习去重、用户覆盖必须共用同一语义，否则
+// 'notgithub.com' 这类域名会在学习侧被误判为"已有规则"而永不进入学习，
+// 或在覆盖侧误命中 'github.com' 的覆盖规则。
+function domainMatchesRuleDomain(domain, ruleDomain) {
+  const host = String(domain || '').toLowerCase().replace(/\.$/, '');
+  const candidate = String(ruleDomain || '').toLowerCase().replace(/\.$/, '');
+  if (!host || !candidate || candidate.includes('/')) return false;
+  const recommendationCore = typeof globalThis !== 'undefined' ? globalThis.BookmarkRecommendationCore : null;
+  if (recommendationCore?.hostnameMatchesRule) {
+    return recommendationCore.hostnameMatchesRule(host, candidate);
+  }
+  return host === candidate || host.endsWith('.' + candidate);
+}
+
 // ===== 从域名匹配标签（动态规则优先，再内置） =====
 function matchDomainTag(domain) {
   if (!domain) return null;
 
   const lowerDomain = domain.toLowerCase().replace(/\.$/, '');
-  const matchesDomain = ruleDomain => {
-    const candidate = String(ruleDomain || '').toLowerCase().replace(/\.$/, '');
-    if (!candidate || candidate.includes('/')) return false;
-    const recommendationCore = typeof globalThis !== 'undefined' ? globalThis.BookmarkRecommendationCore : null;
-    if (recommendationCore?.hostnameMatchesRule) {
-      return recommendationCore.hostnameMatchesRule(lowerDomain, candidate);
-    }
-    return lowerDomain === candidate || lowerDomain.endsWith('.' + candidate);
-  };
+  const matchesDomain = ruleDomain => domainMatchesRuleDomain(lowerDomain, ruleDomain);
 
   // 动态规则优先（含自动学习到的域名→标签）
   const mergedRules = getMergedDomainRules();
@@ -1987,12 +1903,16 @@ async function autoTagBookmark(bookmark, options = {}) {
   const signals = {};  // tag -> string[] 信号来源
   const tagColors = {};
 
-  function addScore(tag, score, signal) {
+  // 可变参数：标题层会一次传入 regex/keyword/fuzzy/ngram 多个信号，全部保留。
+  // 只留第一个会让仅靠 fuzzy 首次命中的标签失去 direct 资格（见 hasDirectLocalSignal）。
+  function addScore(tag, score, ...signalList) {
     tag = canonicalCategoryTag(tag);
     if (!tag) return;
     scores[tag] = (scores[tag] || 0) + score;
     if (!signals[tag]) signals[tag] = [];
-    signals[tag].push(signal);
+    for (const item of signalList) {
+      if (item !== undefined) signals[tag].push(item);
+    }
   }
 
   // 解析 URL 深度特征，供后续多层使用
@@ -2130,21 +2050,11 @@ async function autoTagBookmark(bookmark, options = {}) {
     addScore(tag, normalized * SIGNAL_WEIGHTS.prototypeBm25 * contentDamp, `prototype-bm25:${tag}:${score.toFixed(3)}`);
   }
 
-  // Layer 4.8: 图关系推理（兄弟标签传播 + 时序聚类 + 域名共现）
+  // Layer 4.8: 图关系推理（时序聚类）
   const knownTags = Object.keys(scores);
-  if (bookmark.parentId) {
-    const siblingScores = await inferTagsFromSiblings(bookmark.id, bookmark.parentId);
-    for (const [tag, score] of Object.entries(siblingScores)) {
-      addScore(tag, score, 'sibling-propagation');
-    }
-  }
   const temporalScores = await inferTagsFromTemporalCluster(bookmark.url, bookmark.dateAdded || Date.now());
   for (const [tag, score] of Object.entries(temporalScores)) {
     if (knownTags.includes(tag)) addScore(tag, score, 'temporal-cluster');
-  }
-  const cooccurScores = await getDomainCooccurrenceTags(bookmark.domain, knownTags);
-  for (const [tag, score] of Object.entries(cooccurScores)) {
-    addScore(tag, score, 'domain-cooccurrence');
   }
 
   // Layer 4.9: 云端 AI 分类增强（仅对低置信样本触发）
@@ -2222,7 +2132,7 @@ async function autoTagBookmark(bookmark, options = {}) {
   // Layer 6: 用户覆盖（最高优先级）
   const overrides = await getUserOverrides();
   for (const override of overrides) {
-    if (bookmark.domain && bookmark.domain.includes(override.domain)) {
+    if (domainMatchesRuleDomain(bookmark.domain, override.domain)) {
       if (scores[override.autoTag] !== undefined) {
         addScore(override.userTag, 100, 'user-override');
       }
@@ -2265,12 +2175,16 @@ function autoTagBookmarkSync(bookmark) {
   const signals = {};
   const tagColors = {};
 
-  function addScore(tag, score, signal) {
+  // 可变参数：标题层会一次传入 regex/keyword/fuzzy/ngram 多个信号，全部保留。
+  // 只留第一个会让仅靠 fuzzy 首次命中的标签失去 direct 资格（见 hasDirectLocalSignal）。
+  function addScore(tag, score, ...signalList) {
     tag = canonicalCategoryTag(tag);
     if (!tag) return;
     scores[tag] = (scores[tag] || 0) + score;
     if (!signals[tag]) signals[tag] = [];
-    signals[tag].push(signal);
+    for (const item of signalList) {
+      if (item !== undefined) signals[tag].push(item);
+    }
   }
 
   // 解析 URL 深度特征
@@ -2454,7 +2368,7 @@ function autoTagBookmarkSync(bookmark) {
   // Layer 6: 用户覆盖（仅当缓存就绪时）
   if (_userOverridesCache) {
     for (const override of _userOverridesCache) {
-      if (bookmark.domain && bookmark.domain.includes(override.domain)) {
+      if (domainMatchesRuleDomain(bookmark.domain, override.domain)) {
         if (scores[override.autoTag] !== undefined) {
           addScore(override.userTag, 100, 'user-override');
         }
@@ -2603,8 +2517,10 @@ async function learnDomainTag(domain, folderName) {
 
   // 2. 若该域名未在任何域名规则中且置信度足够，自动加入 domainRules
   const learned = rules.learnedDomainTag[lowerDomain];
-  const inBuiltin = DOMAIN_RULES.some(r => r.domains.some(d => lowerDomain.includes(d)));
-  const inDynamic = (rules.domainRules || []).some(r => r.domains.some(d => lowerDomain.includes(d)));
+  // 与 matchDomainTag 共用后缀语义：用 includes 会把 'notgithub.com' 误判为已在
+  // 内置规则中，导致它永不进入自动学习，而分类时又匹配不上，学习闭环断裂。
+  const inBuiltin = DOMAIN_RULES.some(r => r.domains.some(d => domainMatchesRuleDomain(lowerDomain, d)));
+  const inDynamic = (rules.domainRules || []).some(r => r.domains.some(d => domainMatchesRuleDomain(lowerDomain, d)));
   if (!inBuiltin && !inDynamic && learned.count >= 2) {
     if (!rules.domainRules) rules.domainRules = [];
     const existingRule = rules.domainRules.find(r => r.tag === folderName && r.source !== 'user');

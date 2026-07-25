@@ -313,6 +313,9 @@ const I18N_MESSAGES = {
     // Import / Export
     importEmpty: "No valid bookmarks in the file",
     importFailed: "Import failed",
+    importHistory: "Import history",
+    importHistoryDesc: "Review recent imports and their completed, partial, or undone status.",
+    refresh: "Refresh",
     importedCount: "Imported, $1 new bookmarks",
     exportJson: "Export JSON",
     exportHtml: "Export HTML",
@@ -977,6 +980,9 @@ const I18N_MESSAGES = {
     // Import / Export
     importEmpty: "文件中没有有效的书签",
     importFailed: "导入失败",
+    importHistory: "导入操作记录",
+    importHistoryDesc: "查看最近导入的完成、部分失败和撤销状态。",
+    refresh: "刷新",
     importedCount: "已导入，新增 $1 项",
     exportJson: "导出 JSON",
     exportHtml: "导出 HTML",
@@ -1357,11 +1363,23 @@ function i18n(key, substitutions) {
 }
 
 // 初始化 i18n（从存储中加载语言设置）
+// 各页面均以 initI18n().then(init) 串起整个初始化链，若这里抛错，init 永不执行，
+// 页面会永久停在 loading 骨架（graph 的 #graphLoading、checker 的历史结果等）。
+// 因此语言读取失败时降级为默认语言，而不是中断初始化。
 async function initI18n() {
-  const result = await chrome.storage.local.get('language');
-  const lang = result.language || 'system';
+  let lang = 'system';
+  try {
+    const result = await chrome.storage.local.get('language');
+    lang = result.language || 'system';
+  } catch (err) {
+    console.warn('读取语言设置失败，使用默认语言:', err);
+  }
   setCurrentLang(lang);
-  applyI18n();
+  try {
+    applyI18n();
+  } catch (err) {
+    console.warn('应用界面翻译失败:', err);
+  }
 }
 
 // 应用翻译到所有带 data-i18n 属性的元素

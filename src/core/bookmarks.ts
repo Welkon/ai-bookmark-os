@@ -139,6 +139,23 @@ export async function getBookmarkFolders(): Promise<BookmarkFolderOption[]> {
 }
 
 /** 仅读取所选目录子树，并拍平其中可分类的书签。 */
+/** 收集目录自身及其祖先构成的绝对路径，与 getFlatBookmarks 的 folderPath 口径一致。 */
+async function collectAncestorPath(node: chrome.bookmarks.BookmarkTreeNode): Promise<string[]> {
+  const parts: string[] = [];
+  let current: chrome.bookmarks.BookmarkTreeNode | undefined = node;
+  while (current) {
+    const title = current.title?.trim() ?? '';
+    if (title && !isBrowserBookmarkRoot(title)) parts.unshift(title);
+    if (!current.parentId || current.parentId === '0') break;
+    try {
+      [current] = await chrome.bookmarks.get(current.parentId);
+    } catch {
+      break;
+    }
+  }
+  return parts;
+}
+
 export async function getFolderClassificationScope(folderId: string): Promise<FolderClassificationScope> {
   if (!folderId?.trim()) {
     throw new Error('请选择需要分类的目录。');
@@ -186,7 +203,10 @@ export async function getFolderClassificationScope(folderId: string): Promise<Fo
       }
     }
   };
-  walk(root.children, root.title ? [root.title] : []);
+  // 局部范围必须与 getFlatBookmarks 生成同样的绝对路径：
+  // 只用 root.title 作前缀会丢掉祖先层级，导致 preservedFolderPaths 之类按完整路径
+  // 匹配的规则在局部分类时全部失配（用户标记“保持原样”的书签会被重新分类）。
+  walk(root.children, await collectAncestorPath(root));
 
   if (!bookmarks.length) {
     throw new Error('所选目录下没有可分类的书签。');

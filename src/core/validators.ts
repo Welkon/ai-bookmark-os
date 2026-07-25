@@ -63,6 +63,57 @@ export function validateSettings(raw: unknown): Settings {
     throw new Error('apiKey 必须为字符串');
   }
 
+  // baseUrl 决定请求发往哪个端点，而 apiKey 由本机保留后一并附在请求头上。
+  // 若不校验，一个手改的导入包就能把真实密钥指向任意地址，因此必须限制为 https
+  // （本地代理调试放行 localhost/127.0.0.1）。
+  if (s.baseUrl !== undefined) {
+    if (typeof s.baseUrl !== 'string') throw new Error('baseUrl 必须为字符串');
+    if (s.baseUrl) {
+      let parsed: URL;
+      try {
+        parsed = new URL(s.baseUrl);
+      } catch {
+        throw new Error(`baseUrl 不是合法 URL：${s.baseUrl}`);
+      }
+      const isLocal = parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1';
+      if (parsed.protocol !== 'https:' && !isLocal) {
+        throw new Error(`baseUrl 必须使用 https：${s.baseUrl}`);
+      }
+    }
+  }
+
+  for (const field of ['model', 'fontFamily', 'themeColor'] as const) {
+    if (s[field] !== undefined && typeof s[field] !== 'string') {
+      throw new Error(`${field} 必须为字符串`);
+    }
+  }
+  if (s.customFullUrl !== undefined && typeof s.customFullUrl !== 'boolean') {
+    throw new Error('customFullUrl 必须为布尔值');
+  }
+  const validApiStyles = new Set(['openai', 'anthropic', 'gemini']);
+  if (s.customApiStyle !== undefined && !validApiStyles.has(String(s.customApiStyle))) {
+    throw new Error(`customApiStyle 值无效：${s.customApiStyle}`);
+  }
+
+  // classifyPrompts 的字段会被 resolveClassifyPrompts 直接调用 .trim()，
+  // preservedFolder* 会被 .map()，非法类型会让分类流程持续抛错且重启后依旧损坏。
+  if (s.classifyPrompts !== undefined) {
+    if (!isRecord(s.classifyPrompts)) throw new Error('classifyPrompts 必须为对象');
+    for (const key of ['label', 'buildTree', 'assign'] as const) {
+      const value = (s.classifyPrompts as Record<string, unknown>)[key];
+      if (value !== undefined && typeof value !== 'string') {
+        throw new Error(`classifyPrompts.${key} 必须为字符串`);
+      }
+    }
+  }
+  for (const field of ['preservedFolderPaths', 'preservedFolderIds'] as const) {
+    if (s[field] === undefined) continue;
+    const value = s[field];
+    if (!Array.isArray(value) || !value.every((item) => typeof item === 'string')) {
+      throw new Error(`${field} 必须为字符串数组`);
+    }
+  }
+
   // 合并 DEFAULT_SETTINGS 保证所有字段都存在
   return { ...DEFAULT_SETTINGS, ...s } as Settings;
 }

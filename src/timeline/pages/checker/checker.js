@@ -693,7 +693,8 @@ async function deleteBookmarkItems(items) {
   const ids = new Set();
   for (const item of items) {
     try {
-      const response = await chrome.runtime.sendMessage({ action: 'deleteBookmark', id: item.bookmark.id, url: item.bookmark.url });
+      // 不传 url：非 http(s) 书签会被消息校验拦成 invalid_url，后台以 id 为主键删除。
+      const response = await chrome.runtime.sendMessage({ action: 'deleteBookmark', id: item.bookmark.id });
       if (response?.success) ids.add(String(item.bookmark.id));
     } catch (_) {}
   }

@@ -124,6 +124,40 @@ try {
     },
   );
   assert.equal(calls, 1, '认证失败属于不可重试错误，不得继续消耗连接次数');
+
+  // 内置 gemini 供应商在 baseUrl 被清空（导入/迁移）时，chat 请求 URL 必须回退到
+  // 供应商默认 host，而不是生成缺 host 的相对 URL 导致请求必然失败、无法分类。
+  // 这与 openai/anthropic 分支经 resolveRequestUrl 的回退语义保持一致。
+  calls = 0;
+  let capturedGeminiUrl = '';
+  globalThis.fetch = async (url) => {
+    calls += 1;
+    capturedGeminiUrl = String(url);
+    return {
+      status: 200,
+      ok: true,
+      text: async () => JSON.stringify({ candidates: [{ content: { parts: [{ text: 'OK' }] } }] }),
+    };
+  };
+  assert.equal(
+    await chat(
+      { provider: 'gemini', apiKey: 'k', baseUrl: '', model: 'gemini-2.0-flash', aiRetryCount: 0 },
+      [{ role: 'user', content: 'test' }],
+    ),
+    'OK',
+  );
+  const geminiRequestUrl = new URL(capturedGeminiUrl);
+  assert.ok(geminiRequestUrl.host, 'gemini baseUrl 为空时请求 URL 必须回退到供应商默认 host');
+  assert.equal(
+    geminiRequestUrl.host,
+    'generativelanguage.googleapis.com',
+    'gemini 空 baseUrl 应回退到内置供应商默认 host',
+  );
+  assert.match(
+    geminiRequestUrl.pathname,
+    /\/models\/gemini-2\.0-flash:generateContent$/,
+    'gemini 回退 URL 路径必须仍指向 generateContent 端点',
+  );
 } finally {
   globalThis.setTimeout = nativeSetTimeout;
   globalThis.clearTimeout = nativeClearTimeout;

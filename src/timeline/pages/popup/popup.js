@@ -2025,7 +2025,9 @@ async function handleQuickBookmarkClick() {
 // ===== 单个删除 =====
 async function deleteBookmark(id, url, element) {
   try {
-    const result = await chrome.runtime.sendMessage({ action: 'deleteBookmark', id, url });
+    // 不传 url：非 http(s) 书签（file://、chrome:// 等）会被消息校验拦成 invalid_url，
+    // 而后台删除逻辑以 id 为主键，url 仅作历史兜底。
+    const result = await chrome.runtime.sendMessage({ action: 'deleteBookmark', id });
     if (result && result.success) {
       element.style.transition = 'all 200ms ease';
       element.style.opacity = '0';

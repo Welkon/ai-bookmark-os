@@ -394,7 +394,8 @@ async function syncAll() {
 
 async function deleteBookmark(id, url) {
   try {
-    const res = await chrome.runtime.sendMessage({ action: 'deleteBookmark', id, url });
+    // 不传 url：非 http(s) 书签会被消息校验拦成 invalid_url，后台以 id 为主键删除。
+    const res = await chrome.runtime.sendMessage({ action: 'deleteBookmark', id });
     if (res && res.success) {
       showToast(i18n('deleted'), 'success');
       await refreshBookmarkData();

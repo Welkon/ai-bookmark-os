@@ -142,9 +142,17 @@ assert.match(classifier, /if\s*\(options\.persist\s*!==\s*false\)\s*await saveCl
 const queue = await importTypeScript('src/core/incrementalQueue.ts');
 await queue.enqueueIncrementalBookmarks([{ id: 'new-1', createdAt: 1 }]);
 assert.equal((await queue.loadIncrementalQueue()).length, 1);
-await queue.markIncrementalQueueFailed(['new-1'], 'network_error');
+// 失败转移只走 port 租约（lease.fail 携带 ownerId），message 版已移除：后台的
+// failIncrementalClassificationQueue 强制要求 ownerId 匹配 running 项，无主调用恒为 no-op。
+// 这里直接置入一次失败后的状态，继续校验"取消重排不得清空 attempts"。
+incrementalQueue = incrementalQueue.map((item) => ({
+  ...item,
+  status: 'running',
+  attempts: 1,
+  lastError: 'network_error',
+  nextAttemptAt: 0,
+}));
 assert.equal((await queue.loadIncrementalQueue())[0].lastError, 'network_error');
-incrementalQueue = incrementalQueue.map((item) => ({ ...item, status: 'running', nextAttemptAt: 0 }));
 await queue.releaseIncrementalQueue(['new-1']);
 assert.equal((await queue.loadIncrementalQueue())[0].attempts, 1, '用户取消后重新排队不得清空既有失败次数');
 assert.equal((await queue.loadIncrementalQueue())[0].status, 'pending');

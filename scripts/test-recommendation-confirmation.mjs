@@ -45,6 +45,10 @@ const context = {
   normalizeBookmarkFolderPath: value => String(value || '').split('/').map(part => part.trim()).filter(Boolean).join('/'),
   normalizeTagList: values => Array.from(values || [], String),
   pendingQuickBookmarks,
+  setPendingQuickBookmark: (url, payload) => {
+    if (!url) return;
+    pendingQuickBookmarks.set(url, { ...payload, queuedAt: Date.now() });
+  },
   programmaticBookmarkMoves: new Set(),
   recommendationUrlFingerprint: value => `fingerprint:${value}`,
   self: { BookmarkRecommendationCore: null },

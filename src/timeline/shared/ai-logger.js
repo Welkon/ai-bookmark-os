@@ -87,9 +87,10 @@ async function getAILogStats() {
     const avgDuration = latencies.length > 0
       ? Math.round(latencies.reduce((a, b) => a + b, 0) / latencies.length)
       : 0;
-    const cacheHitRate = cacheHit + triggered > 0
-      ? (cacheHit / (cacheHit + triggered))
-      : 0;
+    // 每次 classifyWithAI 都先写一条 trigger 日志，缓存命中时再补一条 cache_hit，
+    // 因此 triggered 已覆盖全部调用次数；把 cacheHit 也算进分母会让同一次调用计两遍，
+    // 命中率上限只能到 0.5。
+    const cacheHitRate = triggered > 0 ? Math.min(1, cacheHit / triggered) : 0;
     return { total, triggered, success, fail, cacheHit, cacheHitRate, backfillSuccess, backfillFail, avgDuration };
   } catch (e) {
     return { total: 0, triggered: 0, success: 0, fail: 0, cacheHit: 0, cacheHitRate: 0, backfillSuccess: 0, backfillFail: 0, avgDuration: 0 };

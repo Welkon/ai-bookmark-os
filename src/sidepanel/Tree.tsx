@@ -581,7 +581,16 @@ function BookmarkItem({
         />
       )}
       <img src={faviconUrl(bookmark.url)} alt="" />
-      <span className="bm-title">{bookmark.title}</span>
+      <button
+        type="button"
+        className="bm-title"
+        onClick={(event) => {
+          event.stopPropagation();
+          chrome.tabs.create({ url: bookmark.url });
+        }}
+      >
+        {bookmark.title}
+      </button>
     </div>
   );
 }

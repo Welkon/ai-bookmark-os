@@ -100,11 +100,21 @@ export async function importBundle(json: string): Promise<ImportResult> {
   if (normalizedResult) writes.classifyResult = normalizedResult;
   await chrome.storage.local.set(writes);
 
-  // 设置合并：仅接受对象类型，保留本机 apiKey；validateSettings 做范围/枚举校验
+  // 设置合并：仅接受对象类型，保留本机凭据字段；validateSettings 做范围/枚举校验。
+  // apiKey 与端点字段（baseUrl/customFullUrl/customApiStyle）是一组配对凭据：
+  // 只保留 apiKey 而放行端点，等于让数据包把本机真实 key 指向任意服务端
+  // （baseUrl → resolveRequestUrl，apiKey → Authorization 头）。端点变更必须走设置界面。
   if (bundle.settings && typeof bundle.settings === 'object' && !Array.isArray(bundle.settings)) {
     const { validateSettings } = await import('./validators');
     const current = await loadSettings();
-    const safe = validateSettings({ ...current, ...bundle.settings, apiKey: current.apiKey });
+    const safe = validateSettings({
+      ...current,
+      ...bundle.settings,
+      apiKey: current.apiKey,
+      baseUrl: current.baseUrl,
+      customFullUrl: current.customFullUrl,
+      customApiStyle: current.customApiStyle,
+    });
     await saveSettings(safe);
   }
 

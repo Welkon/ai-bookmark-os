@@ -3587,13 +3587,13 @@ function renderPendingReviews(queue) {
       <div class="review-actions">
         <input type="text" class="review-tag-input" placeholder="${i18n('tagPlaceholder') || '标签'}" value="${escapeHtml((item.suggestedTags || [])[0] || '')}">
         <button class="btn btn-primary btn-sm review-confirm" data-id="${escapeHtml(item.id)}">
-          <span data-i18n="confirm">确认</span>
+          <span>${i18n('confirm') || '确认'}</span>
         </button>
         <button class="btn btn-secondary btn-sm review-modify" data-id="${escapeHtml(item.id)}">
-          <span data-i18n="modify">修改</span>
+          <span>${i18n('modify') || '修改'}</span>
         </button>
         <button class="btn btn-danger btn-sm review-ignore" data-id="${escapeHtml(item.id)}">
-          <span data-i18n="ignore">忽略</span>
+          <span>${i18n('ignore') || '忽略'}</span>
         </button>
       </div>
     </div>

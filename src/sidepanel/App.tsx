@@ -344,7 +344,9 @@ export function App() {
   }, []);
   const partialDialogRef = useDialogAccessibility(showPartialModal, closePartialModal, !preparingPartial);
   const applyDialogRef = useDialogAccessibility(showApplyModal, closeApplyModal, !applying);
-  const estimateDialogRef = useDialogAccessibility(!!estimate, closeEstimate, !classificationPending);
+  // 关闭预估弹窗不受 classificationPending 约束：runClassify 一进入就会清空 estimate，
+  // 所以弹窗仍在时该标志只可能来自后台增量分类，禁用关闭会把侧栏锁死在灰按钮遮罩里。
+  const estimateDialogRef = useDialogAccessibility(!!estimate, closeEstimate);
   const whatsNewDialogRef = useDialogAccessibility(!!whatsNew, closeWhatsNew);
   const d = t(uiSettings.language);
   const partialText = resolveLang(uiSettings.language) === 'zh'
@@ -827,8 +829,10 @@ export function App() {
             exhausted = true;
           }
         } else {
+          // 尚未认领任何条目就失败（典型是服务工作线程休眠后首次消息被拒），
+          // 一条书签都没分类，不能报"分类失败"打扰用户；安排重试等待后台就绪。
           console.warn('Incremental queue unavailable:', terminalError);
-          exhausted = true;
+          scheduleTickRetry();
         }
         if (progressRun) {
           finishClassificationProgress(progressRun.runId, exhausted
@@ -913,13 +917,17 @@ export function App() {
     void openOrFocusExtensionPage('pages/settings/settings.html#ai');
   }, []);
 
-  const requestPageMetadataPermission = useCallback(async (): Promise<boolean> => {
+  /**
+   * 申请站点访问权限。已授权时经 contains 短路，不会重复弹窗。
+   * 调用异常（如手势失效）与用户明确拒绝需要区分：前者提示可重试，后者说明降级行为。
+   */
+  const requestPageMetadataPermission = useCallback(async (): Promise<'granted' | 'denied' | 'unavailable'> => {
     try {
       const origins = ['<all_urls>'];
-      if (await chrome.permissions.contains({ origins })) return true;
-      return await chrome.permissions.request({ origins });
+      if (await chrome.permissions.contains({ origins })) return 'granted';
+      return (await chrome.permissions.request({ origins })) ? 'granted' : 'denied';
     } catch {
-      return false;
+      return 'unavailable';
     }
   }, []);
 
@@ -951,8 +959,12 @@ export function App() {
         return;
       }
       if (settings.usePageMetadata !== false) {
-        const granted = await requestPageMetadataPermission();
-        if (!granted) setNotice('未授予站点访问权限：本次分类仅使用书签标题、URL 和目录，不抓取页面内容。');
+        const permission = await requestPageMetadataPermission();
+        if (permission === 'denied') {
+          setNotice('未授予站点访问权限：本次分类仅使用书签标题、URL 和目录，不抓取页面内容。');
+        } else if (permission === 'unavailable') {
+          setNotice('无法发起站点访问授权，本次分类仅使用书签标题、URL 和目录。可在扩展权限设置中手动授予后重试。');
+        }
       }
       ctrl = new AbortController();
       abortRef.current = ctrl;
@@ -1045,8 +1057,12 @@ export function App() {
         return;
       }
       if (settings.usePageMetadata !== false) {
-        const granted = await requestPageMetadataPermission();
-        if (!granted) setNotice('未授予站点访问权限：本次分类仅使用书签标题、URL 和目录，不抓取页面内容。');
+        const permission = await requestPageMetadataPermission();
+        if (permission === 'denied') {
+          setNotice('未授予站点访问权限：本次分类仅使用书签标题、URL 和目录，不抓取页面内容。');
+        } else if (permission === 'unavailable') {
+          setNotice('无法发起站点访问授权，本次分类仅使用书签标题、URL 和目录。可在扩展权限设置中手动授予后重试。');
+        }
       }
       const all = await getFlatBookmarks();
       setEstimate({
@@ -1523,10 +1539,12 @@ export function App() {
       const b = bookmarkById.get(id);
       const l = viewedResult.labels[id];
       return (
-        b?.title.toLowerCase().includes(q) ||
-        b?.url.toLowerCase().includes(q) ||
-        l?.summary.toLowerCase().includes(q) ||
-        l?.tags.some((tag) => tag.toLowerCase().includes(q))
+        // 字段级可选链：旧版本或导入的数据可能缺 summary/tags，
+        // 少一个 ?. 就会在用户输入搜索词时抛错并让整个侧栏白屏。
+        b?.title?.toLowerCase().includes(q) ||
+        b?.url?.toLowerCase().includes(q) ||
+        l?.summary?.toLowerCase().includes(q) ||
+        l?.tags?.some((tag) => String(tag ?? '').toLowerCase().includes(q))
       );
     };
     const filter = (nodes: CategoryNode[]): CategoryNode[] =>
@@ -1860,7 +1878,7 @@ export function App() {
                 selectedFolderId={selectedLiveFolderId}
                 onSelectFolder={(folder) => setSelectedLiveFolderId((current) => current === folder.id ? '' : folder.id)}
               />
-            ) : workspaceView === 'draft' && filteredTree && viewedResult ? (
+            ) : workspaceView === 'draft' && filteredTree && filteredTree.length > 0 && viewedResult ? (
               <Tree
                 key={isHistoricalVersion
                   ? `history:${selectedHistoryVersionId}`
@@ -1892,6 +1910,11 @@ export function App() {
                   </details>
                 )) : <p className="empty-sub">暂无分类应用记录。</p>}
               </div>
+            ) : workspaceView === 'draft' && viewedResult && search.trim() && filteredTree && filteredTree.length === 0 ? (
+              <div className="empty state-view">
+                <p>{resolveLang(uiSettings.language) === 'zh' ? '没有匹配的书签。' : 'No matching bookmarks.'}</p>
+                <p className="empty-sub">{resolveLang(uiSettings.language) === 'zh' ? '试试其它关键词，或清空搜索框查看全部分类。' : 'Try another keyword, or clear the search box to see all folders.'}</p>
+              </div>
             ) : !running ? (
               <div className="empty state-view">
                 <div className="empty-illustration" aria-hidden="true">
@@ -1900,8 +1923,8 @@ export function App() {
                     <path d="M12 12l8-4.5M12 12v9M12 12L4 7.5" />
                   </svg>
                 </div>
-                <p>{workspaceView === 'live' ? '当前书签树加载中…' : d.emptyLine1(bookmarks.length)}</p>
-                <p className="empty-sub">{workspaceView === 'live' ? '请稍后重试刷新。' : d.emptyLine2}</p>
+                <p>{workspaceView === 'live' ? (error ? '当前书签树读取失败。' : '当前书签树加载中…') : d.emptyLine1(bookmarks.length)}</p>
+                <p className="empty-sub">{workspaceView === 'live' ? (error ? '请检查扩展权限后重试。' : '请稍后重试刷新。') : d.emptyLine2}</p>
               </div>
             ) : null}
             {running && (
@@ -2041,7 +2064,7 @@ export function App() {
           )}
 
           {estimate && (
-            <div className="modal-backdrop" onClick={() => !classificationPending && closeEstimate()}>
+            <div className="modal-backdrop" onClick={closeEstimate}>
               <div ref={estimateDialogRef} className="modal" role="dialog" aria-modal="true" aria-labelledby="estimateDialogTitle" tabIndex={-1} onClick={(e) => e.stopPropagation()}>
                 <h3 id="estimateDialogTitle">{estimate.scope.mode === 'partial' ? partialText.estimateTitle : d.estimateTitle}</h3>
                 <div className="modal-body">
@@ -2067,7 +2090,7 @@ export function App() {
                   </small>
                 </div>
                 <div className="actions">
-                  <button type="button" className="btn" onClick={closeEstimate} disabled={classificationPending}>{d.cancel}</button>
+                  <button type="button" className="btn" onClick={closeEstimate}>{d.cancel}</button>
                   <button type="button" className="btn btn-primary" onClick={() => runClassify(estimate.scope)} disabled={classificationPending}>{d.startNow}</button>
                 </div>
               </div>

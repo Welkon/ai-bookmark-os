@@ -146,7 +146,11 @@
         const item = { id: 'item_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8), feedId, guid: it.guid, title: it.title || '', link: it.link || '', author: it.author || '', publishedAt: it.publishedAt || 0, summary: it.summary || '', contentSnippet: it.contentSnippet || '', imageUrl: it.imageUrl || '', read: false, starred: false, bookmarkId: null, savedAt: null, fetchedAt: Date.now() };
         existing.push(item); guidSet.add(it.guid); added.push(item);
       }
-      existing.sort((a, b) => (b.publishedAt || 0) - (a.publishedAt || 0));
+      // 日期解析失败的条目 publishedAt 为 0；若直接按 publishedAt 排序，新抓到的无日期条目
+      // 与已有的无日期条目比较结果为 0，稳定排序会把新条目留在后面，达上限后永久被截断丢弃。
+      // 回退到 fetchedAt 可让新条目排在旧的无日期条目之前。
+      const sortKey = (item) => item.publishedAt || item.fetchedAt || 0;
+      existing.sort((a, b) => sortKey(b) - sortKey(a));
       const limit = maxItems || 100; if (existing.length > limit) existing.length = limit;
       // 只把截断后仍留存的条目视为"新增"：否则达上限时收到的旧日期(publishedAt=0)新条目
       // 会被排序挤出存储却仍返回给调用方，导致对永不落库的条目反复通知/建书签。

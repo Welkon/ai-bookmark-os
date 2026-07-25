@@ -28,6 +28,8 @@ const PAGE_CONTENT_CACHE_TTL = 30 * 24 * 60 * 60 * 1000;
 const PAGE_CONTENT_CACHE_MAX = 500;
 const PAGE_CONTENT_FETCH_TIMEOUT = 12000;
 const PAGE_CONTENT_FETCH_RETRIES = 2;
+// 正文入库上限：下游最长消费 4000 字符，留一倍余量即可覆盖全部使用场景。
+const CONTENT_TEXT_MAX_CHARS = 8000;
 
 function isContentUrl(url) {
   return /^https?:\/\//i.test(String(url || ''));
@@ -120,7 +122,10 @@ function extractReadableTextFromHtml(html) {
 }
 
 function makeContentResult(url, patch) {
-  const textContent = normalizeExtractedText(patch?.textContent || '');
+  const fullText = normalizeExtractedText(patch?.textContent || '');
+  // 正文同时写入 page_content_cache 与每条书签镜像，而下游消费最多只取前 4000 字符。
+  // 不截断会让长文页面单条占据数十万字符，撑爆 chrome.storage.local 的 10MB 配额。
+  const textContent = fullText.slice(0, CONTENT_TEXT_MAX_CHARS);
   const status = patch?.status || (textContent.length >= 80 ? 'success' : 'empty');
   const failureReason = status === 'success' ? '' : (patch?.failureReason || 'readable_content_empty');
   return {
@@ -135,7 +140,7 @@ function makeContentResult(url, patch) {
     metaKeywords: Array.isArray(patch?.metaKeywords) ? patch.metaKeywords.map(normalizeExtractedText).filter(Boolean).slice(0, 20) : [],
     headings: Array.isArray(patch?.headings) ? patch.headings.map(normalizeExtractedText).filter(Boolean).slice(0, 20) : [],
     structuredTypes: Array.isArray(patch?.structuredTypes) ? patch.structuredTypes.map(value => String(value).trim()).filter(Boolean).slice(0, 12) : [],
-    lengthChars: textContent.length,
+    lengthChars: fullText.length,
     fetchedAt: patch?.fetchedAt || Date.now(),
     elapsedMs: patch?.elapsedMs || 0,
     source: patch?.source || 'unknown'
@@ -1296,6 +1301,19 @@ async function mergeLabelCache(entries) {
     ...Object.fromEntries(entries || []),
   }));
 }
+// 会以 message.url 为目标发起网络抓取（或把结果写入抓取缓存）的 action。
+// 这些必须限制为 http/https/ftp；其余 action 的 url 只是书签标识，不受协议限制。
+const URL_FETCHING_ACTIONS = new Set([
+  'getPreview',
+  'setPreviewCache',
+  'suggestFolder',
+  'fetchMeta',
+  'fetchPageContext',
+  'probeUrl',
+  'checkUrl',
+  'recheckUrlWithSession',
+]);
+
 function isSafeExternalUrl(value) {
   if (typeof value !== 'string' || value.length === 0 || value.length > 4096) return false;
   try {
@@ -1407,7 +1425,13 @@ function validateRuntimeMessage(message) {
   if (message.requestId !== undefined && (typeof message.requestId !== 'string' || message.requestId.length > 256)) return 'invalid_request_id';
   if (message.title !== undefined && (typeof message.title !== 'string' || message.title.length > 512)) return 'invalid_title';
   if (message.error !== undefined && (typeof message.error !== 'string' || message.error.length > 512)) return 'invalid_error';
-  if (message.url !== undefined && !isSafeExternalUrl(message.url)) return 'invalid_url';
+  if (message.url !== undefined) {
+    // 仅当该 action 会真正发起网络请求时，才要求 url 是可抓取的外部地址。
+    // 书签自身可能是 file:// / chrome:// / javascript: 等，删除、编辑、墓碑等操作
+    // 必须允许这些协议，否则镜像里的这类书签在页面上永远删不掉、改不了。
+    if (typeof message.url !== 'string' || message.url.length === 0 || message.url.length > 4096) return 'invalid_url';
+    if (URL_FETCHING_ACTIONS.has(message.action) && !isSafeExternalUrl(message.url)) return 'invalid_url';
+  }
   if (message.request !== undefined) {
     const r = message.request;
     if (!r || typeof r !== 'object' || Array.isArray(r)) return 'invalid_request';
@@ -2320,8 +2344,27 @@ async function syncAllBookmarks() {
   return syncAllInFlight;
 }
 // 暂存一键收藏的标签/文件夹信息，供 onCreated → addSingleBookmark 消费
-// key: url, value: { tags, folderName, folderPath }
+// key: url, value: { tags, folderName, folderPath, queuedAt }
 const pendingQuickBookmarks = new Map();
+// 条目正常在紧随其后的 onCreated 中被消费；若 create 失败或事件未派发，
+// 陈旧条目不得被后续同 URL 的收藏误当成"本次已确认的分类结果"。
+const PENDING_QUICK_BOOKMARK_TTL = 5 * 60 * 1000;
+
+function setPendingQuickBookmark(url, payload) {
+  if (!url) return;
+  pendingQuickBookmarks.set(url, { ...payload, queuedAt: Date.now() });
+}
+
+function takePendingQuickBookmark(url) {
+  if (!url) return null;
+  const pending = pendingQuickBookmarks.get(url);
+  if (!pending) return null;
+  pendingQuickBookmarks.delete(url);
+  if (Number.isFinite(pending.queuedAt) && Date.now() - pending.queuedAt > PENDING_QUICK_BOOKMARK_TTL) {
+    return null;
+  }
+  return pending;
+}
 const INCREMENTAL_CLASSIFY_QUEUE_KEY = 'incrementalClassificationQueue';
 const INCREMENTAL_MAX_ATTEMPTS = 3;
 const INCREMENTAL_RETRY_BASE_MS = 30 * 1000;
@@ -3572,11 +3615,13 @@ async function buildBookmarkRecommendation(bookmark, options = {}) {
     summary = core.summarizeRecommendation(tagCandidates, folderCandidates);
   }
 
+  // rankCandidates 现在多返回几条候选，过滤后在此截回 3 条：对外的 folders 长度契约不变，
+  // 但前几名都不合格时不再白丢后面的既存目录。
   summary.folders = summary.folders.filter((candidate) => candidate.exists || (
     candidate.confidence === 'high'
     && candidate.positiveFamilies?.includes('ai')
     && candidate.positiveFamilies.some(family => family !== 'ai')
-  ));
+  )).slice(0, 3);
   const top = summary.folders[0] || summary.tags[0] || null;
   summary.confidence = top?.confidence || 'none';
   summary.abstained = !top || top.confidence === 'none';
@@ -4086,7 +4131,7 @@ async function saveConfirmedBookmark(draft) {
     } catch {}
   }
 
-  pendingQuickBookmarks.set(draft.url, {
+  setPendingQuickBookmark(draft.url, {
     tags: finalTags,
     folderName,
     folderPath,
@@ -4161,7 +4206,14 @@ async function saveConfirmedBookmark(draft) {
       }
     }));
   } else {
-    createdBookmark = await chrome.bookmarks.create(createOpts);
+    try {
+      createdBookmark = await chrome.bookmarks.create(createOpts);
+    } catch (error) {
+      // 创建失败时必须清理待处理记录，否则这条"已确认"的标签/目录会残留，
+      // 被之后任何一次同 URL 的书签创建当作本次确认结果套用。
+      pendingQuickBookmarks.delete(draft.url);
+      throw error;
+    }
   }
 
   const dfText = `${draft.title || ''} ${(draft.contentText || '').slice(0, 1000)} ${draft.url || ''}`;
@@ -4228,9 +4280,9 @@ async function injectBookmarkConfirmPanel(tabId, state) {
       const folderCandidates = Array.isArray(panelState.folderCandidates) ? panelState.folderCandidates.slice(0, 3) : [];
       const isChinese = String(panelState.panelLanguage || '').toLowerCase().startsWith('zh');
       const copy = isChinese ? {
-        title: '智能分类建议', analyzingPage: '正在分析当前页面', loading: '正在分析页面并生成分类建议...', cancel: '取消收藏', titleLabel: '标题', aiCategory: '目录候选', existingCategory: '已有目录', newCategory: '新目录候选', newPrefix: '新建：', newCategoryLabel: '新建分类', searchCategory: '搜索已有分类，例如 公司 / 项目 / 文档', matchingCategories: '匹配的已有分类', selectCategory: '选择书签分类', useExisting: '沿用已有：', selectExisting: '选择已有分类...', manualPath: '手动输入路径...', pathExample: '例如：工作/公司/项目', categoryHint: '仅高置信建议会预选；也可以搜索已有目录或输入新路径。', tags: '标签', tagHint: '用逗号分隔', recommendedPath: '推荐路径', summary: '摘要说明', summaryHint: '可手动补充摘要', reason: '归类理由', reasonHint: '可手动补充归类理由', contentReady: '已读取页面正文（$1 字）并用于本地分类。', contentFallback: '未读取到可用正文，本次使用标题、URL 与目录画像判断。', aiReady: 'AI 已在低置信或冲突时参与校验，你可以继续确认或修改。', localReady: '当前建议由本地规则与目录画像生成。', noRecommendation: '当前证据不足，暂不预选分类。', retry: '重新分析', reject: '不采用建议', rejected: '已记录拒绝，请手动选择分类或直接收藏。', high: '高置信', medium: '中置信', low: '低置信', confirm: '确认收藏', duplicateTitle: '该页面已收藏', duplicateNote: '该页面已收藏在“$1”（$2）。请选择将它移动到当前目标，或在当前目标保留一份副本。', copy: '保留副本', move: '移动到此处', saving: '正在收藏...', saved: '已收藏', duplicateError: '该页面已经在书签中。', saveFailed: '收藏失败：', unknown: '未知错误', searchMatches: '匹配 $1 个已有分类，可点击结果或按 Enter 选中', searchHint: '可直接下拉选择，也可搜索 $1 个已有分类'
+        title: '智能分类建议', analyzingPage: '正在分析当前页面', loading: '正在分析页面并生成分类建议...', cancel: '取消收藏', titleLabel: '标题', aiCategory: '目录候选', existingCategory: '已有目录', newCategory: '新目录候选', newPrefix: '新建：', newCategoryLabel: '新建分类', searchCategory: '搜索已有分类，例如 公司 / 项目 / 文档', matchingCategories: '匹配的已有分类', selectCategory: '选择书签分类', useExisting: '沿用已有：', selectExisting: '选择已有分类...', manualPath: '手动输入路径...', pathExample: '例如：工作/公司/项目', categoryHint: '仅高置信建议会预选；也可以搜索已有目录或输入新路径。', tags: '标签', tagHint: '用逗号分隔', recommendedPath: '推荐路径', summary: '摘要说明', summaryHint: '可手动补充摘要', reason: '归类理由', reasonHint: '可手动补充归类理由', contentReady: '已读取页面正文（$1 字）并用于本地分类。', contentFallback: '未读取到可用正文，本次使用标题、URL 与目录画像判断。', aiReady: 'AI 已在低置信或冲突时参与校验，你可以继续确认或修改。', localReady: '当前建议由本地规则与目录画像生成。', noRecommendation: '当前证据不足，暂不预选分类。', retry: '重新分析', reject: '不采用建议', rejected: '已记录拒绝，请手动选择分类或直接收藏。', high: '高置信', medium: '中置信', low: '低置信', confirm: '确认收藏', duplicateTitle: '该页面已收藏', duplicateNote: '该页面已收藏在“$1”（$2）。请选择将它移动到当前目标，或在当前目标保留一份副本。', copy: '保留副本', move: '移动到此处', saving: '正在收藏...', saved: '已收藏', duplicateError: '该页面已经在书签中。', saveFailed: '收藏失败：', unknown: '未知错误', searchMatches: '匹配 $1 个已有分类，可点击结果或按 Enter 选中', searchHint: '可直接下拉选择，也可搜索 $1 个已有分类', failedTitle: '无法生成分类建议', failedHint: '可关闭本面板后重试，或改用扩展弹窗收藏。', close: '关闭', errorRetryHint: '可关闭面板后重试，或手动收藏该页面。', errors: { unsupported_page: '当前页面不支持快捷收藏（如浏览器内部页）。', error_page: '当前标签页是错误页，请先打开可访问的网页。', restricted_page: '当前页面受浏览器限制，无法注入收藏建议面板。', tab_unavailable: '当前标签页不可用，请切换到普通网页后重试。', timeout: '生成收藏建议超时，请稍后重试。', quick_bookmark_failed: '无法为当前页面创建收藏建议。' }
       } : {
-        title: 'Smart folder suggestion', analyzingPage: 'Analyzing the current page', loading: 'Analyzing the page and preparing suggestions...', cancel: 'Cancel bookmark', titleLabel: 'Title', aiCategory: 'Folder candidates', existingCategory: 'Existing folder', newCategory: 'New folder candidate', newPrefix: 'Create: ', newCategoryLabel: 'Create new folder', searchCategory: 'Search folders, e.g. Work / Projects / Docs', matchingCategories: 'Matching folders', selectCategory: 'Choose bookmark folder', useExisting: 'Use existing: ', selectExisting: 'Choose an existing folder...', manualPath: 'Enter a path manually...', pathExample: 'Example: Work/Company/Project', categoryHint: 'Only high-confidence suggestions are preselected. You can search or enter another path.', tags: 'Tags', tagHint: 'Separate with commas', recommendedPath: 'Suggested path', summary: 'Summary', summaryHint: 'Add a summary', reason: 'Why this folder', reasonHint: 'Add a reason', contentReady: 'Page content was read ($1 characters) and used for local classification.', contentFallback: 'No usable page content was read; this result uses the title, URL, and folder profiles.', aiReady: 'AI was used to verify a low-confidence or conflicting result.', localReady: 'Suggestions are based on local rules and folder profiles.', noRecommendation: 'Evidence is insufficient, so no folder was preselected.', retry: 'Analyze again', reject: 'Reject suggestion', rejected: 'Rejection recorded. Choose a folder manually or save without one.', high: 'High', medium: 'Medium', low: 'Low', confirm: 'Save bookmark', duplicateTitle: 'This page is already bookmarked', duplicateNote: 'This page is already in “$1” ($2). Move it to the current destination or keep a copy there.', copy: 'Keep a copy', move: 'Move here', saving: 'Saving...', saved: 'Saved', duplicateError: 'This page is already bookmarked.', saveFailed: 'Could not save: ', unknown: 'Unknown error', searchMatches: '$1 matching folders. Click a result or press Enter to select it.', searchHint: 'Choose from the list or search $1 existing folders'
+        title: 'Smart folder suggestion', analyzingPage: 'Analyzing the current page', loading: 'Analyzing the page and preparing suggestions...', cancel: 'Cancel bookmark', titleLabel: 'Title', aiCategory: 'Folder candidates', existingCategory: 'Existing folder', newCategory: 'New folder candidate', newPrefix: 'Create: ', newCategoryLabel: 'Create new folder', searchCategory: 'Search folders, e.g. Work / Projects / Docs', matchingCategories: 'Matching folders', selectCategory: 'Choose bookmark folder', useExisting: 'Use existing: ', selectExisting: 'Choose an existing folder...', manualPath: 'Enter a path manually...', pathExample: 'Example: Work/Company/Project', categoryHint: 'Only high-confidence suggestions are preselected. You can search or enter another path.', tags: 'Tags', tagHint: 'Separate with commas', recommendedPath: 'Suggested path', summary: 'Summary', summaryHint: 'Add a summary', reason: 'Why this folder', reasonHint: 'Add a reason', contentReady: 'Page content was read ($1 characters) and used for local classification.', contentFallback: 'No usable page content was read; this result uses the title, URL, and folder profiles.', aiReady: 'AI was used to verify a low-confidence or conflicting result.', localReady: 'Suggestions are based on local rules and folder profiles.', noRecommendation: 'Evidence is insufficient, so no folder was preselected.', retry: 'Analyze again', reject: 'Reject suggestion', rejected: 'Rejection recorded. Choose a folder manually or save without one.', high: 'High', medium: 'Medium', low: 'Low', confirm: 'Save bookmark', duplicateTitle: 'This page is already bookmarked', duplicateNote: 'This page is already in “$1” ($2). Move it to the current destination or keep a copy there.', copy: 'Keep a copy', move: 'Move here', saving: 'Saving...', saved: 'Saved', duplicateError: 'This page is already bookmarked.', saveFailed: 'Could not save: ', unknown: 'Unknown error', searchMatches: '$1 matching folders. Click a result or press Enter to select it.', searchHint: 'Choose from the list or search $1 existing folders', errorTitle: 'Could not create a suggestion', errorRetryHint: 'Close this panel and try again, or bookmark the page manually.', close: 'Close', errors: { unsupported_page: 'This page cannot be quick-bookmarked (browser internal pages).', error_page: 'This tab is an error page. Open a normal webpage first.', restricted_page: 'This page is restricted by the browser and the suggestion panel cannot run here.', tab_unavailable: 'The current tab is unavailable. Switch to a normal page and retry.', timeout: 'The suggestion timed out. Please try again later.', quick_bookmark_failed: 'Unable to create a bookmark suggestion for this page.' }
       };
       const format = (text, ...values) => values.reduce((result, value, index) => result.replace(`$${index + 1}`, value), text);
       const contentLength = String(panelState.contentText || '').trim().length;
@@ -4392,7 +4444,11 @@ async function injectBookmarkConfirmPanel(tabId, state) {
         </style>
         <section class="ab-card" role="dialog" aria-modal="false" aria-labelledby="abTitle">
           <div class="ab-head"><div class="ab-icon">${panelState.aiTriggered ? 'AI' : 'A'}</div><div class="ab-head-copy"><h2 id="abTitle">${copy.title}</h2><div class="ab-sub">${esc(panelState.title || copy.analyzingPage)}<br>${esc(panelState.url || '')}</div></div><button class="ab-close" data-act="cancel" aria-label="${isChinese ? String.fromCharCode(0x5173, 0x95ed) : 'Close'}" title="${isChinese ? String.fromCharCode(0x5173, 0x95ed) : 'Close'}">&times;</button></div>
-          ${panelState.status === 'loading' ? `
+          ${panelState.status === 'error' ? `
+            <div class="ab-note ab-error">${esc(copy.errors[panelState.error] || copy.errors.quick_bookmark_failed)}</div>
+            <div class="ab-folder-hint">${copy.errorRetryHint}</div>
+            <div class="ab-actions"><button class="ab-secondary" data-act="cancel">${copy.close}</button></div>
+          ` : panelState.status === 'loading' ? `
             <div class="ab-loading"><span class="ab-dot"></span><span class="ab-dot"></span><span class="ab-dot"></span><span>${copy.loading}</span></div>
             <div class="ab-actions"><button class="ab-secondary" data-act="cancel">${copy.cancel}</button></div>
           ` : `
@@ -4811,11 +4867,8 @@ async function addSingleBookmark(id) {
     if (!bookmark || !bookmark[0] || !bookmark[0].url) return null;
 
     const b = bookmark[0];
-    // 消费 pending 的快速收藏信息（标签 + 文件夹）
-    const pending = pendingQuickBookmarks.get(b.url);
-    if (pending) {
-      pendingQuickBookmarks.delete(b.url);
-    }
+    // 消费 pending 的快速收藏信息（标签 + 文件夹），过期条目视为不存在
+    const pending = takePendingQuickBookmark(b.url);
 
     const item = bookmarkToItem(b, pending?.folderName, pending?.folderPath);
     if (pending?.tags && pending.tags.length > 0) {
@@ -5072,7 +5125,7 @@ async function saveRssArticleAsBookmark(item, feed, settings) {
     } catch { /* 标签失败不阻塞保存 */ }
 
     // 4. 通过 pendingQuickBookmarks 将标签和文件夹信息传递给 onCreated → addSingleBookmark
-    pendingQuickBookmarks.set(item.link, {
+    setPendingQuickBookmark(item.link, {
       tags: tagNames,
       folderName,
       folderPath,
@@ -5234,10 +5287,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const bookmarks = await getStoredBookmarks();
         const removedIds = new Set();
         const failedIds = [];
-        for (const b of bookmarks) {
+        // 串行逐条删除在书签量大时会远超单次消息处理窗口，中断后 tombstone 与镜像
+        // （都在循环之后才写）一条都不更新。并发上限与 enrichClickCounts 保持一致。
+        await runWithConcurrency(bookmarks, 10, async (b) => {
           if (!b.id) {
             failedIds.push(b.url || 'unknown');
-            continue;
+            return;
           }
           try {
             await chrome.bookmarks.remove(b.id);
@@ -5245,7 +5300,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           } catch (err) {
             failedIds.push(b.id);
           }
-        }
+        });
         const retentionDays = await getEffectiveRetentionDays();
         await mutateTombstones(async (current) => {
           const merged = [...await pruneTombstones(current, retentionDays)];
@@ -5273,7 +5328,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           total: remainingCount,
           error: failedIds.length ? 'some_bookmarks_could_not_be_deleted' : undefined,
         });
-      })();
+      })().catch((err) => sendResponse({ success: false, error: err?.message || 'clear_all_failed' }));
       return true;
 
     case 'updateBookmark':
@@ -6321,7 +6376,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       (async () => {
         const feeds = await FeedStore.getAllFeeds();
         sendResponse({ success: true, feeds });
-      })();
+      })().catch((err) => sendResponse({ success: false, error: err?.message || 'rss_operation_failed' }));
       return true;
     }
 
@@ -6341,7 +6396,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           unreadCounts[f.id] = items.filter(i => !i.read).length;
         }
         sendResponse({ success: true, feeds, unreadCounts });
-      })();
+      })().catch((err) => sendResponse({ success: false, error: err?.message || 'rss_operation_failed' }));
       return true;
     }
 
@@ -6391,7 +6446,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             }
           }).catch(() => {});
         }
-      })();
+      })().catch((err) => sendResponse({ success: false, error: err?.message || 'rss_operation_failed' }));
       return true;
     }
 
@@ -6400,7 +6455,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const result = await FeedStore.removeFeed(message.feedId);
         FeedNotifier.updateBadge();
         sendResponse(result);
-      })();
+      })().catch((err) => sendResponse({ success: false, error: err?.message || 'rss_operation_failed' }));
       return true;
     }
 
@@ -6408,7 +6463,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       (async () => {
         const result = await FeedStore.updateFeed(message.feedId, message.patch || {});
         sendResponse(result);
-      })();
+      })().catch((err) => sendResponse({ success: false, error: err?.message || 'rss_operation_failed' }));
       return true;
     }
 
@@ -6416,7 +6471,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       (async () => {
         const result = await FeedStore.reorderFeeds(message.orderedIds || []);
         sendResponse(result);
-      })();
+      })().catch((err) => sendResponse({ success: false, error: err?.message || 'rss_operation_failed' }));
       return true;
     }
 
@@ -6425,7 +6480,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const result = await FeedFetcher.refreshFeed(message.feedId);
         FeedNotifier.updateBadge();
         sendResponse(result || { success: true });
-      })();
+      })().catch((err) => sendResponse({ success: false, error: err?.message || 'rss_operation_failed' }));
       return true;
     }
 
@@ -6433,7 +6488,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       (async () => {
         const result = await FeedFetcher.refreshAll();
         sendResponse({ success: true, result });
-      })();
+      })().catch((err) => sendResponse({ success: false, error: err?.message || 'rss_operation_failed' }));
       return true;
     }
 
@@ -6443,7 +6498,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           ? await FeedStore.getItems(message.feedId)
           : await FeedStore.getAllItems();
         sendResponse({ success: true, items });
-      })();
+      })().catch((err) => sendResponse({ success: false, error: err?.message || 'rss_operation_failed' }));
       return true;
     }
 
@@ -6452,7 +6507,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const result = await FeedStore.setItemRead(message.itemId, message.feedId, message.read);
         FeedNotifier.updateBadge();
         sendResponse(result);
-      })();
+      })().catch((err) => sendResponse({ success: false, error: err?.message || 'rss_operation_failed' }));
       return true;
     }
 
@@ -6461,7 +6516,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const result = await FeedStore.markAllRead(message.feedId);
         FeedNotifier.updateBadge();
         sendResponse(result);
-      })();
+      })().catch((err) => sendResponse({ success: false, error: err?.message || 'rss_operation_failed' }));
       return true;
     }
 
@@ -6470,7 +6525,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const result = await FeedStore.markAllFeedsRead();
         FeedNotifier.updateBadge();
         sendResponse(result);
-      })();
+      })().catch((err) => sendResponse({ success: false, error: err?.message || 'rss_operation_failed' }));
       return true;
     }
 
@@ -6478,7 +6533,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       (async () => {
         const result = await FeedStore.setItemStarred(message.itemId, message.feedId, message.starred);
         sendResponse(result);
-      })();
+      })().catch((err) => sendResponse({ success: false, error: err?.message || 'rss_operation_failed' }));
       return true;
     }
 
@@ -6486,7 +6541,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       (async () => {
         const settings = await FeedStore.getSettings();
         sendResponse({ success: true, settings });
-      })();
+      })().catch((err) => sendResponse({ success: false, error: err?.message || 'rss_operation_failed' }));
       return true;
     }
 
@@ -6496,7 +6551,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         // 轮询周期可能变更，重新调度
         await FeedFetcher.reschedule();
         sendResponse({ success: true });
-      })();
+      })().catch((err) => sendResponse({ success: false, error: err?.message || 'rss_operation_failed' }));
       return true;
     }
 
@@ -6519,7 +6574,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         } catch (e) {
           sendResponse({ success: false, error: e.message });
         }
-      })();
+      })().catch((err) => sendResponse({ success: false, error: err?.message || 'rss_operation_failed' }));
       return true;
     }
 
@@ -6527,7 +6582,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       (async () => {
         const feeds = await FeedDiscover.discoverForActiveTab();
         sendResponse({ success: true, feeds });
-      })();
+      })().catch((err) => sendResponse({ success: false, error: err?.message || 'rss_operation_failed' }));
       return true;
     }
 
@@ -6544,7 +6599,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const settings = await FeedStore.getSettings();
         const result = await saveRssArticleAsBookmark(item, feed, settings);
         sendResponse(result);
-      })();
+      })().catch((err) => sendResponse({ success: false, error: err?.message || 'rss_operation_failed' }));
       return true;
     }
 
@@ -6578,11 +6633,25 @@ chrome.bookmarks.onCreated.addListener((id, bookmark) => {
   }
 });
 
-chrome.bookmarks.onChanged.addListener((id, changeInfo) => {
-  updateBookmark(id, changeInfo);
-});
-
 let bookmarkMoveUpdateQueue = Promise.resolve();
+
+// 书签改名/改址走 updateBookmark；文件夹改名要按新标题重算整棵子树的 folderName/folderPath，
+// 否则镜像会长期保留旧目录名（仅在下次全量同步时才纠正）。与 onMoved 共用串行队列避免竞态。
+chrome.bookmarks.onChanged.addListener((id, changeInfo) => {
+  bookmarkMoveUpdateQueue = bookmarkMoveUpdateQueue.then(async () => {
+    try {
+      const bookmark = await chrome.bookmarks.get(id);
+      if (!bookmark || !bookmark[0]) return;
+      if (bookmark[0].url) {
+        await updateBookmark(id, changeInfo);
+      } else {
+        await handleFolderMoved(id);
+      }
+    } catch (e) {
+      // 静默失败，不影响书签编辑
+    }
+  }).catch(() => {});
+});
 
 // 单个书签移动：更新镜像的 parentId/folderName/folderPath；来源不可信的移动进入待复核观察。
 async function handleSingleBookmarkMoved(id, node, moveInfo) {
@@ -6852,6 +6921,28 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
 
   if (!alarm.name.startsWith(CHECKER_ALARM_PREFIX)) return;
 
+  // 定时检测整体兜底：Chrome 不消费 listener 返回的 promise，任一 await 抛错
+  // （典型是结果写入超出 storage 配额）都会变成静默的 unhandled rejection，
+  // 用户侧表现为"配置了定时检测但永远没有结果"。这里改为落盘 failed 状态。
+  try {
+    await runScheduledBookmarkCheck();
+  } catch (err) {
+    console.error('Scheduled bookmark check failed:', err);
+    await chrome.storage.local.set({
+      checkerLastResult: {
+        version: 2,
+        timestamp: Date.now(),
+        source: 'scheduled',
+        status: 'failed',
+        counts: { total: 0, completed: 0, pending: 0, normal: 0, confirmedMissing: 0, needsReview: 0 },
+        results: [],
+        reason: err?.message || 'scheduled_check_failed',
+      },
+    }).catch(() => {});
+  }
+});
+
+async function runScheduledBookmarkCheck() {
   if (!await chrome.permissions.contains({ origins: ['<all_urls>'] })) {
     await chrome.storage.local.set({
       checkerLastResult: {
@@ -6935,7 +7026,8 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
       } finally {
         releaseDomainSlot(domain);
       }
-      results.push({ bookmark: bm, checkResult });
+      // 只保留 checker 页面消费的字段：整条镜像含正文，写入 storage 会撑爆配额。
+      results.push({ bookmark: { id: bm.id, title: bm.title, url: bm.url }, checkResult });
     }
   }
 
@@ -6973,7 +7065,7 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
       message: `Detected ${confirmedMissing} confirmed missing bookmarks; manual cleanup is required.`,
     });
   }
-});
+}
 
 // ===== 关闭所有独立窗口 =====
 function closeStandaloneWindows() {
@@ -7221,8 +7313,11 @@ function localizeQuickBookmarkError(err) {
 }
 
 async function handleQuickBookmark(activeTab) {
+  // 面板注入的目标页在 catch 中也要用到（推送失败态），因此提升到 try 之外。
+  let panelTab = activeTab || null;
   try {
     const tab = activeTab || (await chrome.tabs.query({ active: true, currentWindow: true }))[0];
+    panelTab = tab || panelTab;
     if (!tab || !tab.url || tab.url.startsWith('chrome://') || tab.url.startsWith('chrome-extension://')) {
       return { success: false, error: 'unsupported_page' };
     }
@@ -7242,7 +7337,18 @@ async function handleQuickBookmark(activeTab) {
     return { success: true, pending: true, draft };
   } catch (err) {
     console.error('快捷收藏建议失败:', err);
-    return { success: false, error: localizeQuickBookmarkError(err) };
+    const reason = localizeQuickBookmarkError(err);
+    // 快捷键/右键菜单入口不消费返回值，若不把失败态推回页面，
+    // 之前注入的 loading 面板会永久停在"正在分析..."。
+    if (panelTab?.id) {
+      await injectBookmarkConfirmPanel(panelTab.id, {
+        status: 'error',
+        error: reason,
+        title: panelTab.title || '',
+        url: panelTab.url || '',
+      }).catch(() => {});
+    }
+    return { success: false, error: reason };
   }
 }
 

@@ -248,13 +248,20 @@ function computeHealthScore(metrics) {
   const folderedRate = folderedCount / total;
   const duplicateRate = duplicateCount / total;
 
+  // 时间戳归一化：earliest 在无书签时为 Infinity，dateAdded 也可能是未来时间。
+  // 不归一化会让 daysSinceFirst 退化成 1（活跃度直接满分）、daysSinceLast 变成 0 或负数
+  // （时效性直接满分），健康分失去参考价值。
+  const now = Date.now();
+  const firstAt = Number.isFinite(earliest) && earliest > 0 ? Math.min(earliest, now) : now;
+  const lastAt = Number.isFinite(latest) && latest > 0 ? Math.min(latest, now) : 0;
+
   // 活跃度：近 30 天平均每天点击数（简单模型）
-  const daysSinceFirst = Math.max(1, Math.round((Date.now() - (earliest || Date.now())) / 86400000));
+  const daysSinceFirst = Math.max(1, Math.round((now - firstAt) / 86400000));
   const avgClicksPerDay = totalClicks / daysSinceFirst;
   const activityScore = Math.min(1, avgClicksPerDay / 5); // 每天 5 次点击为满分
 
-  // 时效性：近 30 天是否有新增
-  const daysSinceLast = Math.round((Date.now() - (latest || Date.now())) / 86400000);
+  // 时效性：近 30 天是否有新增。无有效时间戳时给最低档，而非满分。
+  const daysSinceLast = lastAt > 0 ? Math.round((now - lastAt) / 86400000) : Infinity;
   const recencyScore = daysSinceLast <= 7 ? 1 : (daysSinceLast <= 30 ? 0.6 : 0.2);
 
   // 权重

@@ -242,7 +242,9 @@ function buildRequest(settings: Settings, messages: ChatMessage[], opts: ChatOpt
 
   if (style === 'gemini') {
     const system = messages.filter((m) => m.role === 'system').map((m) => m.content).join('\n');
-    const base = settings.baseUrl.replace(/\/$/, '');
+    // 与 openai/anthropic 分支（走 resolveRequestUrl，内部 settings.baseUrl || provider.baseUrl）
+    // 保持一致：settings.baseUrl 为空时回退到供应商默认 baseUrl，避免生成缺 host 的相对 URL 直接请求失败。
+    const base = String(settings.baseUrl || resolveProvider(settings).baseUrl || '').replace(/\/$/, '');
     return {
       url: `${base}/models/${settings.model}:generateContent`,
       headers: {
@@ -478,7 +480,9 @@ export async function listModels(settings: Settings): Promise<string[]> {
       'anthropic-dangerous-direct-browser-access': 'true',
     };
   } else if (style === 'gemini') {
-    url = `${settings.baseUrl.replace(/\/$/, '')}/models?pageSize=1000`;
+    // 与 chat 请求一致：优先用户 baseUrl，为空时回退到供应商默认，避免相对 URL 拉取模型列表失败。
+    const base = (settings.baseUrl || resolveProvider(settings).baseUrl || '').replace(/\/$/, '');
+    url = `${base}/models?pageSize=1000`;
     headers = { 'x-goog-api-key': settings.apiKey };
   } else {
     // openai 兼容：base 或 .../chat/completions → .../models

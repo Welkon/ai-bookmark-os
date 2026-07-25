@@ -69,6 +69,16 @@ function assignBatchSize(settings: Settings): number {
   const v = Number((settings as any).assignBatchSize ?? ASSIGN_BATCH_SIZE);
   return Number.isFinite(v) ? Math.min(100, Math.max(10, Math.floor(v))) : ASSIGN_BATCH_SIZE;
 }
+
+/**
+ * 归一化 AI 返回的分类编号：接受数字与纯数字字符串（部分模型在 anthropic 格式下
+ * 会把编号返回成 "3" 而非 3）。非整数、负数、NaN 一律返回 null，由调用方兜底。
+ */
+function normalizeCatIndex(cat: unknown): number | null {
+  if (typeof cat === 'number') return Number.isInteger(cat) && cat >= 0 ? cat : null;
+  if (typeof cat === 'string' && /^\d+$/.test(cat.trim())) return Number(cat.trim());
+  return null;
+}
 type ProgressFn = (p: ClassifyProgress) => void;
 
 function abortReason(signal: AbortSignal): unknown {
@@ -636,20 +646,21 @@ async function labelBookmarks(
         ]);
         return [...parsedA, ...parsedB];
       }
-      if (parseError) throw parseError;
-      throw new Error('AI 标签结果不完整，已取消本次分类，未写入书签分类结果。');
+      // 彻底解析失败（截断 / 无法提取 JSON）且一条都没拿到才上抛，交上层拆半；
+      // 拆到最小仍完全失败才真正 fatal。只要能解析出部分结果，漏项由 runBatch
+      // 兜底为空标签（与 assign 阶段兜底到"其他"的容错理念一致），不再取消整次分类。
+      if (parseError && kept.length === 0) throw parseError;
+      return kept;
     };
 
     const parsed = await tryLabel(batch);
 
-    const finalIds = new Set(parsed.map((item) => String(item.id)));
-    if (finalIds.size !== batch.length || !batch.every((bookmark) => finalIds.has(bookmark.id))) {
-      throw new Error('AI 标签结果不完整，已取消本次分类，未写入书签分类结果。');
-    }
-
+    // 写入真实标签（按 id 去重，防模型串号返回重复项）。
+    const labeledIds = new Set<string>();
     for (const item of parsed) {
       const bm = byId.get(String(item.id));
-      if (!bm) continue;
+      if (!bm || labeledIds.has(bm.id)) continue;
+      labeledIds.add(bm.id);
       const label: BookmarkLabel = {
         id: bm.id,
         summary: String(item.summary ?? '').slice(0, 50),
@@ -664,6 +675,13 @@ async function labelBookmarks(
           cachedAt: Date.now(),
           ...(contexts.get(bm.id) ? { pageContext: contexts.get(bm.id) } : {}),
         };
+      }
+    }
+    // AI 漏标的书签兜底为空标签，保证每条都进入后续建树 / 分配（仍可靠标题、URL
+    // 分类）；空标签不写缓存，避免污染下次命中。
+    for (const bookmark of batch) {
+      if (!labeledIds.has(bookmark.id)) {
+        labels[bookmark.id] = { id: bookmark.id, summary: '', tags: [] };
       }
     }
     done += batch.length;
@@ -817,12 +835,17 @@ async function assignBookmarks(
 
   // 确保兜底分类存在（按叶子段名精确匹配，避免“其他工具”等被误判为已存在兜底）
   const FALLBACK = '其他';
-  const hasFallbackLeaf = [...nodeByPath.keys()].some((p) => p.split('/').pop() === FALLBACK);
-  if (!nodeByPath.has(FALLBACK) && !hasFallbackLeaf) {
+  const existingFallbackPath = [...nodeByPath.keys()].find((p) => p.split('/').pop() === FALLBACK);
+  // fallbackPath 一定存在于 nodeByPath / paths，供 AI 漏分配的书签兜底归入。
+  let fallbackPath: string;
+  if (nodeByPath.has(FALLBACK) || existingFallbackPath) {
+    fallbackPath = nodeByPath.has(FALLBACK) ? FALLBACK : existingFallbackPath!;
+  } else {
     const fallbackNode: CategoryNode = { name: FALLBACK };
     tree.push(fallbackNode);
     nodeByPath.set(FALLBACK, fallbackNode);
     paths.push(FALLBACK);
+    fallbackPath = FALLBACK;
   }
   const pathList = paths.map((p, i) => `${i}. ${p}`).join('\n');
 
@@ -884,8 +907,11 @@ async function assignBookmarks(
     const assignmentById = new Map<string, number>();
     for (const a of aiAssignments) {
       const idStr = String(a.id);
-      if (!assignmentById.has(idStr) && Number.isInteger(a.cat) && paths[a.cat]) {
-        assignmentById.set(idStr, a.cat);
+      // cat 放宽：接受数字与字符串数字（部分模型在 anthropic 格式下会把编号返回成 "3"）。
+      // 越界或非法索引不在此纳入，交由主循环兜底到"其他"，不再据此判整批失败。
+      const cat = normalizeCatIndex(a.cat);
+      if (!assignmentById.has(idStr) && cat !== null && paths[cat]) {
+        assignmentById.set(idStr, cat);
       }
     }
     const isComplete = !parseError
@@ -900,8 +926,10 @@ async function assignBookmarks(
       ]);
       return new Map([...mapA, ...mapB]);
     }
-    if (parseError) throw parseError;
-    throw new Error('AI 分配结果不完整，已取消本次分类，未写入书签分类结果。');
+    // 彻底拿不到结果（解析失败 / 截断）才上抛；否则返回能解析到的部分，
+    // AI 漏掉的少数书签由主循环兜底到"其他"，不再让整批 / 整次分类作废。
+    if (parseError && assignmentById.size === 0) throw parseError;
+    return assignmentById;
   };
 
   for (let i = 0; i < bookmarks.length; i += assignBatchSize(settings)) {
@@ -911,8 +939,13 @@ async function assignBookmarks(
 
     const assignmentById = await tryAssign(batch);
 
-    if (assignmentById.size !== batch.length || !batch.every((bookmark) => assignmentById.has(bookmark.id))) {
-      throw new Error('AI 分配结果不完整，已取消本次分类，未写入书签分类结果。');
+    // AI 未能有效分配的书签兜底归入 fallbackPath（"其他"），保证每条都有归属，
+    // 不再因个别漏项抛错取消整次分类。
+    const fallbackCat = paths.indexOf(fallbackPath);
+    for (const bookmark of batch) {
+      if (!assignmentById.has(bookmark.id)) {
+        assignmentById.set(bookmark.id, fallbackCat);
+      }
     }
 
     for (const [id, cat] of assignmentById) assignments.push({ id, cat });
@@ -1046,7 +1079,10 @@ export function expandDuplicateBookmarks(
 export async function loadSavedResult(scope: ClassificationScope = { mode: 'full' }): Promise<ClassifyResult | null> {
   const key = resultStorageKey(scope);
   const data = await chrome.storage.local.get(key);
-  return data[key] ?? null;
+  // 与 listSavedClassifyResults 共用同一守卫：畸形草稿返回 null 走"无草稿"分支，
+  // 而不是把非法树交给下游在读取节点字段时抛错。
+  const saved = data[key];
+  return isSavedClassifyResult(saved) ? saved : null;
 }
 
 export interface SavedClassifyResult {
@@ -1054,13 +1090,29 @@ export interface SavedClassifyResult {
   result: ClassifyResult;
 }
 
+// 树节点逐个校验：只检查容器会让 [null, {name:123}] 这类畸形数据通过，
+// 而 collectPlannedBookmarkIds / planApply 会在读取 node.bookmarkIds 时抛错，
+// 导致工作区加载路径整体崩溃而不是降级。
+function isSavedCategoryNode(value: unknown): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const node = value as Partial<CategoryNode>;
+  if (typeof node.name !== 'string') return false;
+  if (node.bookmarkIds !== undefined
+    && (!Array.isArray(node.bookmarkIds) || !node.bookmarkIds.every((id) => typeof id === 'string'))) return false;
+  if (node.children !== undefined
+    && (!Array.isArray(node.children) || !node.children.every(isSavedCategoryNode))) return false;
+  return true;
+}
+
 function isSavedClassifyResult(value: unknown): value is ClassifyResult {
   if (!value || typeof value !== 'object') return false;
   const candidate = value as Partial<ClassifyResult>;
   return Array.isArray(candidate.tree)
+    && candidate.tree.every(isSavedCategoryNode)
     && !!candidate.labels
     && typeof candidate.labels === 'object'
-    && typeof candidate.createdAt === 'number';
+    // NaN 也满足 typeof === 'number'，会让 savedDraftTimestamp 返回 NaN 使草稿排序失效。
+    && Number.isFinite(candidate.createdAt);
 }
 
 function savedDraftTimestamp(result: ClassifyResult): number {

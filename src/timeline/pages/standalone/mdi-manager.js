@@ -40,6 +40,15 @@
     return d.innerHTML;
   }
 
+  // 图片加载失败的兜底处理（事件委托，捕获阶段——error 事件不冒泡）。
+  // Manifest V3 默认 CSP 禁止内联 onerror，故集中在此按 data-fallback 类型处理。
+  // 站点 favicon.ico 常返回 404，标题栏与任务栏图标需静默隐藏而不是留破图。
+  document.addEventListener('error', (e) => {
+    const img = e.target;
+    if (!(img instanceof HTMLImageElement)) return;
+    if (img.dataset.fallback === 'hide') img.style.display = 'none';
+  }, true);
+
   function normalizeUrl(url) {
     try {
       const u = new URL(url);
@@ -386,7 +395,7 @@
 
       win.innerHTML = `
         <div class="mdi-window-titlebar">
-          <img class="mdi-window-favicon" src="${escapeHtml(faviconUrl)}" alt="" onerror="this.style.display='none'">
+          <img class="mdi-window-favicon" src="${escapeHtml(faviconUrl)}" alt="" data-fallback="hide">
           <span class="mdi-window-title">${escapeHtml(title)}</span>
           <div class="mdi-window-controls">
             <button class="mdi-btn mdi-btn--external" title="${escapeHtml(i18n('mdiOpenNewTab'))}">${SVG_MDI_EXTERNAL}</button>
@@ -792,7 +801,7 @@
         entry.dataset.mdiId = id;
 
         entry.innerHTML = `
-          <img class="mdi-taskbar-entry-favicon" src="${escapeHtml(w.faviconUrl)}" alt="" onerror="this.style.display='none'">
+          <img class="mdi-taskbar-entry-favicon" src="${escapeHtml(w.faviconUrl)}" alt="" data-fallback="hide">
           <span class="mdi-taskbar-entry-title">${escapeHtml(w.title)}</span>
         `;
 

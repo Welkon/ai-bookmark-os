@@ -291,12 +291,16 @@ async function testIncompleteSplitDoesNotPersistDraft() {
     folderPath: 'Inbox',
   }));
   const { classify } = await importTypeScript('src/core/classifier.ts');
+  // label 阶段现已容错：模型对整批返回空标签不再直接 fatal，而是兜底为空标签继续
+  //（书签仍可靠标题/URL 分类）。当模型连分类树也返回空时，buildTree 的空树守卫
+  // 兜住并 fatal，仍不写残缺草稿——这是模型完全不合作时的最后防线。
   await assert.rejects(
     () => classify(baseSettings, bookmarks, () => {}, new AbortController().signal),
-    /AI 标签结果不完整/,
+    /分类树为空/,
   );
-  assert.equal(requests, 3, '完整批次不完整时应拆半复核一次');
-  assert.equal(storage.values.classifyResult, undefined, '拆半后仍不完整时不得写回残缺分类草稿');
+  // 打标拆半 3 次（整批 11 + 两半 6/5）+ 建树 1 次
+  assert.equal(requests, 4, '模型完全不返回时应尝试打标拆半与建树');
+  assert.equal(storage.values.classifyResult, undefined, '模型完全不合作时不得写回残缺分类草稿');
 }
 
 await testEstimateUsesContentContextV5();
