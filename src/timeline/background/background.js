@@ -2206,13 +2206,99 @@ async function rollbackImportOperation(operationId) {
   return { success: operation.status === 'undone', operationId, status: operation.status, ...result };
 }
 // ===== 同步操作 =====
+const SYNC_PROGRESS_MAX_UPDATES = 24;
+let syncProgressState = {
+  status: 'idle',
+  operationId: '',
+  phase: 'idle',
+  completed: 0,
+  total: 0,
+  updatedAt: 0,
+  sequence: 0,
+};
+
+function createSyncOperationId() {
+  return `sync_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function getSyncProgressStatus() {
+  return { ...syncProgressState };
+}
+
+function broadcastSyncProgress(update, waitForDelivery = false) {
+  syncProgressState = {
+    ...syncProgressState,
+    ...update,
+    completed: Math.max(0, Number(update.completed ?? syncProgressState.completed) || 0),
+    total: Math.max(0, Number(update.total ?? syncProgressState.total) || 0),
+    updatedAt: Date.now(),
+    sequence: syncProgressState.sequence + 1,
+  };
+
+  let delivery;
+  try {
+    delivery = Promise.resolve(chrome.runtime.sendMessage({
+      action: 'syncProgress',
+      ...syncProgressState,
+    })).catch(() => undefined);
+  } catch {
+    delivery = Promise.resolve();
+  }
+  return waitForDelivery ? delivery : undefined;
+}
+
+function createSyncProgressReporter(operationId, phase, total) {
+  const expectedTotal = Math.max(0, Number(total) || 0);
+  const interval = Math.max(1, Math.ceil(expectedTotal / SYNC_PROGRESS_MAX_UPDATES));
+  let lastReported = 0;
+  return (completed, reportedTotal = expectedTotal) => {
+    if (syncProgressState.operationId !== operationId || syncProgressState.status !== 'running') return;
+    const normalizedTotal = Math.max(0, Number(reportedTotal) || 0);
+    const normalizedCompleted = Math.min(
+      normalizedTotal,
+      Math.max(0, Number(completed) || 0),
+    );
+    if (normalizedCompleted < normalizedTotal && normalizedCompleted - lastReported < interval) return;
+    lastReported = normalizedCompleted;
+    broadcastSyncProgress({
+      operationId,
+      status: 'running',
+      phase,
+      completed: normalizedCompleted,
+      total: normalizedTotal,
+    });
+  };
+}
+
+function beginSyncProgress() {
+  const operationId = createSyncOperationId();
+  broadcastSyncProgress({
+    operationId,
+    status: 'running',
+    phase: 'reading',
+    completed: 0,
+    total: 0,
+    error: '',
+  });
+  return operationId;
+}
+
 async function syncAllBookmarksOnce() {
+  const operationId = beginSyncProgress();
   const clickCountRefreshGuard = beginClickCountRefreshGuard();
   try {
     await waitForStorageResourceMutations(STORAGE_KEY);
     const tree = await chrome.bookmarks.getTree();
     const allBookmarks = await collectAllBookmarks(tree);
     const existing = await getStoredBookmarks();
+    broadcastSyncProgress({
+      operationId,
+      status: 'running',
+      phase: 'merging',
+      completed: 0,
+      total: allBookmarks.length,
+    });
+    const reportMergeProgress = createSyncProgressReporter(operationId, 'merging', allBookmarks.length);
 
     // 原生 ID 是主键；旧镜像才回退到 URL + 创建时间兼容匹配。
     const existingById = new Map();
@@ -2228,6 +2314,7 @@ async function syncAllBookmarksOnce() {
     const merged = [];
     const currentKeys = new Set();
     const currentIds = new Set();
+    let mergedCount = 0;
     for (const item of allBookmarks) {
       const key = item.url + '_' + item.dateAdded;
       const prev = existingById.get(item.id) || existingByKey.get(key);
@@ -2255,7 +2342,16 @@ async function syncAllBookmarksOnce() {
         added++;
       }
       merged.push(item);
+      mergedCount++;
+      reportMergeProgress(mergedCount, allBookmarks.length);
     }
+    broadcastSyncProgress({
+      operationId,
+      status: 'running',
+      phase: 'merging',
+      completed: allBookmarks.length,
+      total: allBookmarks.length,
+    });
 
     // 检测删除：existing 中存在但 currentKeys 中不存在的项写入 tombstones
     const settings = await getAppSettings();
@@ -2286,8 +2382,20 @@ async function syncAllBookmarksOnce() {
     const refreshedTagKeys = new Set();
     const itemKey = item => item.id || `${item.url}_${item.dateAdded}`;
     let taggedCount = 0;
+    broadcastSyncProgress({
+      operationId,
+      status: 'running',
+      phase: 'tagging',
+      completed: 0,
+      total: needsTag.length,
+    });
     if (needsTag.length > 0 && typeof autoTagBookmarks === 'function') {
-      const tagged = await autoTagBookmarks(needsTag, 10, { skipAI: true });
+      const tagged = await autoTagBookmarks(
+        needsTag,
+        10,
+        { skipAI: true },
+        createSyncProgressReporter(operationId, 'tagging', needsTag.length),
+      );
       const stableAutoTags = selectStableAutoTags(needsTag, tagged);
       for (let index = 0; index < needsTag.length; index++) {
         const localTags = stableAutoTags.get(localTagGroupKey(needsTag[index])) || [];
@@ -2302,10 +2410,35 @@ async function syncAllBookmarksOnce() {
         if (localTags.length > 0) taggedCount++;
       }
     }
+    broadcastSyncProgress({
+      operationId,
+      status: 'running',
+      phase: 'tagging',
+      completed: needsTag.length,
+      total: needsTag.length,
+    });
 
     // 从 Chrome 历史记录获取真实访问次数，并应用到本次同步快照。
-    const clickCountUpdates = await enrichClickCounts(merged, 10);
+    broadcastSyncProgress({
+      operationId,
+      status: 'running',
+      phase: 'clickCounts',
+      completed: 0,
+      total: merged.length,
+    });
+    const clickCountUpdates = await enrichClickCounts(
+      merged,
+      10,
+      createSyncProgressReporter(operationId, 'clickCounts', merged.length),
+    );
     applyClickCountUpdates(merged, clickCountUpdates, clickCountRefreshGuard);
+    broadcastSyncProgress({
+      operationId,
+      status: 'running',
+      phase: 'clickCounts',
+      completed: merged.length,
+      total: merged.length,
+    });
 
     // 排序：置顶在前，再按时间倒序
     merged.sort((a, b) => {
@@ -2313,6 +2446,13 @@ async function syncAllBookmarksOnce() {
       return b.dateAdded - a.dateAdded;
     });
 
+    broadcastSyncProgress({
+      operationId,
+      status: 'running',
+      phase: 'saving',
+      completed: 0,
+      total: merged.length,
+    });
     await mutateStoredBookmarks((latest) => {
       const latestById = new Map(latest.map((item) => [item.id, item]));
       const latestByKey = new Map(latest.map((item) => [item.url + '_' + item.dateAdded, item]));
@@ -2359,9 +2499,24 @@ async function syncAllBookmarksOnce() {
     });
     await waitForStorageResourceMutations(STORAGE_KEY);
     await chrome.storage.local.set({ [CLICK_COUNT_SOURCE_VERSION_KEY]: CLICK_COUNT_SOURCE_VERSION });
-    return { total: merged.length, added, tagged: taggedCount };
+    const result = { total: merged.length, added, tagged: taggedCount, operationId };
+    await broadcastSyncProgress({
+      operationId,
+      status: 'complete',
+      phase: 'complete',
+      completed: merged.length,
+      total: merged.length,
+      error: '',
+    }, true);
+    return result;
   } catch (err) {
     console.error('全量同步失败:', err);
+    await broadcastSyncProgress({
+      operationId,
+      status: 'failed',
+      phase: syncProgressState.operationId === operationId ? syncProgressState.phase : 'failed',
+      error: String(err?.message || err || 'sync_failed').slice(0, 240),
+    }, true);
     throw err;
   } finally {
     endClickCountRefreshGuard(clickCountRefreshGuard);
@@ -5112,7 +5267,7 @@ async function getHistoryClickCount(url) {
 
 // HistoryItem.visitCount is canonical. getVisits().length also includes
 // reload and redirect rows, so mixing the two APIs makes counts jump.
-async function enrichClickCounts(bookmarks, concurrency = 5) {
+async function enrichClickCounts(bookmarks, concurrency = 5, onProgress = null) {
   const itemsByUrl = new Map();
   for (const item of bookmarks || []) {
     const normalizedUrl = normalizeClickCountUrl(item?.url);
@@ -5121,6 +5276,11 @@ async function enrichClickCounts(bookmarks, concurrency = 5) {
     itemsByUrl.get(normalizedUrl).push(item);
   }
 
+  const totalItems = Array.isArray(bookmarks) ? bookmarks.length : 0;
+  let completed = totalItems - [...itemsByUrl.values()].reduce((sum, items) => sum + items.length, 0);
+  if (completed > 0 && typeof onProgress === 'function') {
+    try { onProgress(completed, totalItems); } catch {}
+  }
   const groups = await runWithConcurrency([...itemsByUrl.values()], concurrency, async (items) => {
     try {
       const counts = await getHistoryClickCount(items[0].url);
@@ -5132,6 +5292,11 @@ async function enrichClickCounts(bookmarks, concurrency = 5) {
         .map(item => ({ id: item.id, url: item.url, ...counts }));
     } catch {
       return [];
+    } finally {
+      completed += items.length;
+      if (typeof onProgress === 'function') {
+        try { onProgress(completed, totalItems); } catch {}
+      }
     }
   });
   return groups.flat();
@@ -5405,6 +5570,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         sendResponse({ success: false, error: err.message });
       });
       return true; // 保持通道打开
+
+    case 'getSyncStatus':
+      sendResponse({ success: true, status: getSyncProgressStatus() });
+      return false;
 
     case 'getBookmarks':
       (async () => {

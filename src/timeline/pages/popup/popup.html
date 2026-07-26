@@ -81,6 +81,11 @@
       </div>
     </header>
 
+    <div id="syncProgress" class="sync-progress" role="status" aria-live="polite" aria-atomic="true" hidden>
+      <span id="syncProgressText" class="sync-progress__text"></span>
+      <progress id="syncProgressBar" class="sync-progress__bar" max="1" value="0"></progress>
+    </div>
+
     <div class="chrome-tools">
       <div class="search-bar">
         <svg class="search-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">

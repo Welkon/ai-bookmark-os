@@ -2959,23 +2959,31 @@ async function updateLearningStats(suggestedTags, confirmedTags, action) {
   await saveLearningStats(stats);
 }
 
-async function autoTagBookmarks(bookmarks, concurrency = 10, options = {}) {
+async function autoTagBookmarks(bookmarks, concurrency = 10, options = {}, onProgress = null) {
   const results = new Array(bookmarks.length);
   let nextIndex = 0;
+  let completed = 0;
   const runners = Array.from({ length: Math.min(concurrency, bookmarks.length) }, async () => {
     while (true) {
       const i = nextIndex++;
       if (i >= bookmarks.length) return;
       const bookmark = bookmarks[i];
-      const tags = await autoTagBookmark(bookmark, options);
-      results[i] = {
-        ...bookmark,
-        tags: tags.map(t => t.tag),
-        tagsAuto: tags.map(t => t.tag)
-      };
-      // 仅更新通用文档频率；批量场景的自动标签不直接写入贝叶斯语料，避免未验证标签污染模型
-      const text = `${cleanTitle(bookmark.title || '')} ${bookmark.url || ''}`;
-      await updateDocFrequency(text, bookmark.url);
+      try {
+        const tags = await autoTagBookmark(bookmark, options);
+        results[i] = {
+          ...bookmark,
+          tags: tags.map(t => t.tag),
+          tagsAuto: tags.map(t => t.tag)
+        };
+        // 仅更新通用文档频率；批量场景的自动标签不直接写入贝叶斯语料，避免未验证标签污染模型
+        const text = `${cleanTitle(bookmark.title || '')} ${bookmark.url || ''}`;
+        await updateDocFrequency(text, bookmark.url);
+      } finally {
+        completed++;
+        if (typeof onProgress === 'function') {
+          try { onProgress(completed, bookmarks.length); } catch {}
+        }
+      }
     }
   });
   await Promise.all(runners);

@@ -26,6 +26,9 @@ const saPaletteBtn = $('saPaletteBtn');
 const saToastContainer = $('saToastContainer');
 const saStatusText = $('saStatusText');
 const saStatusFolder = $('saStatusFolder');
+const saSyncProgress = $('saSyncProgress');
+const saSyncProgressText = $('saSyncProgressText');
+const saSyncProgressBar = $('saSyncProgressBar');
 
 // 侧栏 Tab 切换 DOM
 const saSidebarTabs = $('saSidebarTabs');
@@ -77,6 +80,13 @@ let bulkMode = false;
 let selectedIds = new Set();
 let dragState = null;
 let currentTab = 'bookmarks'; // 'bookmarks' | 'rss'
+let syncProgressActive = false;
+let syncProgressOperationId = null;
+let syncProgressLastUpdatedAt = 0;
+let syncProgressLastSequence = 0;
+let syncProgressLastFinishedOperationId = null;
+let syncProgressRequestInFlight = false;
+let syncProgressRefreshPromise = null;
 
 // MDI 多窗口
 let mdiManager = null;
@@ -127,6 +137,145 @@ function showToast(message, type = 'info') {
   toast.textContent = message;
   saToastContainer.appendChild(toast);
   setTimeout(() => { if (toast.parentNode) toast.remove(); }, 2500);
+}
+
+function getSyncProgressPayload(response) {
+  if (!response || typeof response !== 'object') return null;
+  if (typeof response.status === 'string') return response;
+  if (response.syncStatus && typeof response.syncStatus === 'object') return response.syncStatus;
+  if (response.data && typeof response.data === 'object') return response.data;
+  if (response.status && typeof response.status === 'object') return response.status;
+  return null;
+}
+
+function getSyncProgressLabel(progress) {
+  const completed = Number(progress.completed);
+  const total = Number(progress.total);
+  const hasProgress = Number.isFinite(total) && total > 0;
+  const values = [String(Math.max(0, Number.isFinite(completed) ? completed : 0)), String(total)];
+
+  switch (String(progress.phase || '')) {
+    case 'start':
+      return i18n('syncProgressStarting');
+    case 'reading':
+    case 'collecting':
+      return i18n('syncProgressReading');
+    case 'merging':
+    case 'merge':
+      return hasProgress ? i18n('syncProgressMerging', values) : i18n('syncProgressRunning');
+    case 'tagging':
+      return hasProgress ? i18n('syncProgressTagging', values) : i18n('syncProgressRunning');
+    case 'clickCounts':
+    case 'click-counts':
+    case 'click_counts':
+      return hasProgress ? i18n('syncProgressClickCounts', values) : i18n('syncProgressRunning');
+    case 'saving':
+      return i18n('syncProgressSaving');
+    default:
+      return hasProgress ? i18n('syncProgressMerging', values) : i18n('syncProgressRunning');
+  }
+}
+
+function updateSyncButtonState() {
+  const isBusy = syncProgressActive || syncProgressRequestInFlight;
+  saSyncBtn.classList.toggle('spinning', isBusy);
+  saSyncBtn.disabled = isBusy;
+  saSyncBtn.setAttribute('aria-busy', String(isBusy));
+}
+
+function showSyncProgress(progress) {
+  const label = getSyncProgressLabel(progress);
+  const completed = Number(progress.completed);
+  const total = Number(progress.total);
+  const hasProgress = Number.isFinite(total) && total > 0;
+
+  saStatusText.textContent = i18n('syncProgressRunning');
+  saSyncProgressText.textContent = label;
+  saSyncProgressBar.setAttribute('aria-label', label);
+  saSyncProgressBar.setAttribute('aria-valuetext', label);
+  if (hasProgress) {
+    saSyncProgressBar.max = total;
+    saSyncProgressBar.value = Math.min(total, Math.max(0, Number.isFinite(completed) ? completed : 0));
+  } else {
+    saSyncProgressBar.removeAttribute('value');
+  }
+  saSyncProgress.hidden = false;
+  updateSyncButtonState();
+}
+
+function hideSyncProgress() {
+  saStatusText.textContent = i18n('statusReady');
+  saSyncProgress.hidden = true;
+  saSyncProgressText.textContent = '';
+  saSyncProgressBar.removeAttribute('value');
+  saSyncProgressBar.removeAttribute('aria-valuetext');
+  updateSyncButtonState();
+}
+
+function beginSyncProgress() {
+  syncProgressActive = true;
+  syncProgressOperationId = null;
+  showSyncProgress({ phase: 'start' });
+}
+
+function refreshBookmarksAfterSync() {
+  if (!syncProgressRefreshPromise) {
+    syncProgressRefreshPromise = refreshBookmarkData({ keepFilter: true })
+      .catch((err) => {
+        console.error('同步后刷新书签失败:', err);
+        showToast(i18n('loadFailedRetry'), 'error');
+      })
+      .finally(() => { syncProgressRefreshPromise = null; });
+  }
+  return syncProgressRefreshPromise;
+}
+
+function finishSyncProgress(progress) {
+  const operationId = progress?.operationId || syncProgressOperationId;
+  const status = progress?.status || 'complete';
+  const hasFinished = operationId && syncProgressLastFinishedOperationId === operationId;
+
+  syncProgressActive = false;
+  if (operationId) syncProgressOperationId = operationId;
+  if (operationId) syncProgressLastFinishedOperationId = operationId;
+  hideSyncProgress();
+
+  if (status !== 'complete' || hasFinished) return syncProgressRefreshPromise || Promise.resolve();
+  return refreshBookmarksAfterSync();
+}
+
+function handleSyncProgress(progress) {
+  if (!progress || !['running', 'complete', 'failed'].includes(progress.status)) return;
+
+  const operationId = progress.operationId || null;
+  const updatedAt = Number(progress.updatedAt);
+  const sequence = Number(progress.sequence);
+  const hasSequence = Number.isFinite(sequence);
+  if (hasSequence && sequence < syncProgressLastSequence) return;
+  if (!hasSequence && Number.isFinite(updatedAt) && updatedAt < syncProgressLastUpdatedAt) return;
+  if (syncProgressActive && syncProgressOperationId && operationId && operationId !== syncProgressOperationId) return;
+  if (!syncProgressActive && operationId && operationId === syncProgressLastFinishedOperationId) return;
+  if (hasSequence) syncProgressLastSequence = Math.max(syncProgressLastSequence, sequence);
+  if (Number.isFinite(updatedAt)) syncProgressLastUpdatedAt = Math.max(syncProgressLastUpdatedAt, updatedAt);
+
+  if (progress.status === 'running') {
+    syncProgressActive = true;
+    if (operationId) syncProgressOperationId = operationId;
+    showSyncProgress(progress);
+    return;
+  }
+
+  void finishSyncProgress(progress);
+}
+
+async function restoreSyncProgress() {
+  try {
+    const response = await chrome.runtime.sendMessage({ action: 'getSyncStatus' });
+    const progress = getSyncProgressPayload(response);
+    if (progress?.status === 'running') handleSyncProgress(progress);
+  } catch (err) {
+    console.debug('读取同步进度失败:', err);
+  }
 }
 
 // ===== 工具函数 =====
@@ -374,7 +523,7 @@ function refreshClickCountsInBackground() {
 let focusRefreshInFlight = null;
 let lastFocusRefreshAt = 0;
 function refreshBookmarkDataOnFocus() {
-  if (document.hidden || Date.now() - lastFocusRefreshAt < 1000) return;
+  if (document.hidden || syncProgressActive || syncProgressRefreshPromise || Date.now() - lastFocusRefreshAt < 1000) return;
   if (!focusRefreshInFlight) {
     lastFocusRefreshAt = Date.now();
     focusRefreshInFlight = refreshBookmarkData({ keepFilter: true })
@@ -387,21 +536,26 @@ window.addEventListener('focus', refreshBookmarkDataOnFocus);
 document.addEventListener('visibilitychange', refreshBookmarkDataOnFocus);
 
 async function syncAll() {
-  saSyncBtn.classList.add('spinning');
+  if (syncProgressActive || syncProgressRequestInFlight) return;
+  syncProgressRequestInFlight = true;
+  beginSyncProgress();
   try {
     const res = await chrome.runtime.sendMessage({ action: 'syncAll' });
     if (res && res.success) {
       const count = res.added || 0;
       const total = res.total || 0;
+      await finishSyncProgress({ status: 'complete', operationId: res.operationId });
       showToast(count > 0 ? i18n('syncSuccessNew', [String(count)]) : i18n('syncSuccessTotal', [String(total)]), 'success');
-      await refreshBookmarkData({ keepFilter: true });
     } else {
+      await finishSyncProgress({ status: 'failed' });
       showToast(i18n('syncFailed'), 'error');
     }
   } catch (e) {
+    await finishSyncProgress({ status: 'failed' });
     showToast(i18n('syncFailedRetry'), 'error');
   } finally {
-    saSyncBtn.classList.remove('spinning');
+    syncProgressRequestInFlight = false;
+    updateSyncButtonState();
   }
 }
 
@@ -1640,8 +1794,10 @@ function toggleTheme() {
 
 // ===== 监听后台消息 =====
 chrome.runtime.onMessage.addListener((msg) => {
-  if (msg.action === 'bookmarkAdded' || msg.action === 'bookmarksDeleted' || msg.action === 'bookmarksUpdated' || msg.action === 'tagsUpdated') {
-    refreshBookmarkData({ keepFilter: true });
+  if (msg.action === 'syncProgress') {
+    handleSyncProgress(msg);
+  } else if (msg.action === 'bookmarkAdded' || msg.action === 'bookmarksDeleted' || msg.action === 'bookmarksUpdated' || msg.action === 'tagsUpdated') {
+    if (!syncProgressActive && !syncProgressRefreshPromise) refreshBookmarkData({ keepFilter: true });
   }
 });
 
@@ -2444,6 +2600,7 @@ function showBookmarkViews() {
 
 async function startApp() {
   loadTheme();
+  await restoreSyncProgress();
   await loadPreviewEnabled();
   await loadMdiWindowEnabled();
   initSidebarResize();
@@ -2475,7 +2632,7 @@ async function startApp() {
   try {
     await loadFolderTree();
     await refreshBookmarkData({ keepFilter: false });
-    void refreshClickCountsInBackground();
+    if (!syncProgressActive) void refreshClickCountsInBackground();
   } catch (e) {
     console.error('Failed to initialize:', e);
     showToast(i18n('loadFailedRetry'), 'error');

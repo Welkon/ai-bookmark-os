@@ -792,6 +792,39 @@ try {
   assert.deepEqual(compressedRows, [], `narrow settings text is compressed: ${JSON.stringify(compressedRows)}`);
   assert.equal(await settings.getByRole('checkbox', { name: /发送页面内容|Share page content/i }).count(), 1);
 
+  await worker.evaluate(() => {
+    const originalEnrichClickCounts = enrichClickCounts;
+    globalThis.__e2eSyncProgressProbe = { entered: false };
+    enrichClickCounts = async (bookmarks, concurrency, onProgress) => {
+      globalThis.__e2eSyncProgressProbe.entered = true;
+      onProgress?.(0, bookmarks.length);
+      await new Promise(resolve => setTimeout(resolve, 900));
+      try {
+        return await originalEnrichClickCounts(bookmarks, concurrency, onProgress);
+      } finally {
+        enrichClickCounts = originalEnrichClickCounts;
+      }
+    };
+  });
+  const syncProgressPopup = await openExtensionPage(context, extensionId, 'pages/popup/popup.html', pageErrors);
+  await syncProgressPopup.locator('#syncBtn').click();
+  await syncProgressPopup.waitForFunction(() => {
+    const progress = document.getElementById('syncProgress');
+    const text = document.getElementById('syncProgressText')?.textContent || '';
+    return progress && !progress.hidden && /更新访问记录|Updating visit data/i.test(text);
+  }, undefined, { timeout: 15000 });
+  assert.equal(await syncProgressPopup.locator('#syncBtn').isDisabled(), true, 'sync button must be disabled while progress is active');
+  assert.ok(await syncProgressPopup.locator('.bookmark-item').count() > 0, 'sync progress must retain the previous complete bookmark view');
+  await syncProgressPopup.screenshot({ path: join(artifactsPath, 'sync-progress-popup.png'), fullPage: true });
+  await syncProgressPopup.locator('#syncProgress').waitFor({ state: 'hidden', timeout: 20000 });
+  assert.equal(await syncProgressPopup.locator('#syncBtn').isDisabled(), false, 'sync button must recover after completion');
+  assert.equal(
+    await worker.evaluate(() => globalThis.__e2eSyncProgressProbe?.entered === true),
+    true,
+    'sync progress fixture did not reach the delayed click-count phase',
+  );
+  await syncProgressPopup.close();
+
   const pages = [
     ['workspace', 'pages/standalone/standalone.html', /Synthetic|书签|Bookmark/i],
     ['bookmark navigation', 'ai/bookmark-nav.html', /Synthetic React/i],

@@ -238,7 +238,11 @@ assert.match(
 const syncStart = backgroundSource.indexOf('async function syncAllBookmarksOnce()');
 const syncEnd = backgroundSource.indexOf('let syncAllInFlight', syncStart);
 const syncSource = backgroundSource.slice(syncStart, syncEnd);
-assert.match(syncSource, /const clickCountUpdates = await enrichClickCounts\(merged, 10\)/);
+assert.match(
+  syncSource,
+  /const clickCountUpdates = await enrichClickCounts\(\s*merged,\s*10,\s*createSyncProgressReporter\(operationId,\s*['"]clickCounts['"],\s*merged\.length\),\s*\)/,
+  'full sync must report batched click-count reconciliation progress',
+);
 assert.match(syncSource, /applyClickCountUpdates\(merged, clickCountUpdates, clickCountRefreshGuard\)/, 'full sync must protect live visit updates');
 assert.match(syncSource, /clickCountChangedDuringRefresh\(item\.url, clickCountRefreshGuard\)/, 'full sync must preserve current counts changed during its query');
 assert.match(syncSource, /getLatestClickCountDuringRefresh\(item\.url, clickCountRefreshGuard\)/, 'full sync must retain a live count for newly mirrored bookmarks');

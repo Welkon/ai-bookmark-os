@@ -1216,6 +1216,7 @@ body.theme-dark #saThemeBtn .theme-icon-light { display: none; }
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: var(--space-md);
   padding: 4px var(--space-lg);
   border-top: 1px solid var(--border-light);
   font-size: 11px;
@@ -1228,6 +1229,57 @@ body.theme-dark #saThemeBtn .theme-icon-light { display: none; }
   display: flex;
   align-items: center;
   gap: var(--space-md);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sa-sync-progress {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  min-width: 0;
+  max-width: 420px;
+  flex: 1 1 220px;
+  margin-left: auto;
+  color: var(--text-secondary);
+}
+
+.sa-sync-progress[hidden] {
+  display: none;
+}
+
+.sa-sync-progress__text {
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sa-sync-progress__bar {
+  width: 108px;
+  height: 4px;
+  margin: 0;
+  appearance: none;
+  border: 0;
+  border-radius: var(--radius-full);
+  overflow: hidden;
+  background: var(--border-medium);
+  flex: 0 0 auto;
+}
+
+.sa-sync-progress__bar::-webkit-progress-bar {
+  background: var(--border-medium);
+}
+
+.sa-sync-progress__bar::-webkit-progress-value {
+  background: var(--accent);
+}
+
+.sa-sync-progress__bar::-moz-progress-bar {
+  background: var(--accent);
 }
 
 /* ===== Toast ===== */

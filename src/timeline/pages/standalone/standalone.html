@@ -289,6 +289,10 @@
   <!-- 状态栏 -->
   <footer class="sa-statusbar">
     <span id="saStatusText" data-i18n="statusReady">就绪</span>
+    <div id="saSyncProgress" class="sa-sync-progress" role="status" aria-live="polite" aria-atomic="true" hidden>
+      <span id="saSyncProgressText" class="sa-sync-progress__text"></span>
+      <progress id="saSyncProgressBar" class="sa-sync-progress__bar" max="1" value="0"></progress>
+    </div>
     <span class="sa-status-right" id="saStatusFolder"></span>
   </footer>
 

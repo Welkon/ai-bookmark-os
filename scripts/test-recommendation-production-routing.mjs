@@ -22,7 +22,11 @@ assert.deepEqual(
 const syncStart = background.indexOf('async function syncAllBookmarksOnce(');
 const syncEnd = background.indexOf('let syncAllInFlight', syncStart);
 const syncSource = background.slice(syncStart, syncEnd);
-assert.match(syncSource, /autoTagBookmarks\s*\(needsTag,\s*10,\s*\{\s*skipAI:\s*true\s*\}\)/, 'history sync must locally tag without AI');
+assert.match(
+  syncSource,
+  /autoTagBookmarks\s*\(\s*needsTag,\s*10,\s*\{\s*skipAI:\s*true\s*\},\s*createSyncProgressReporter\(operationId,\s*['"]tagging['"],\s*needsTag\.length\),\s*\)/,
+  'history sync must locally tag without AI and expose tag progress',
+);
 assert.match(syncSource, /shouldRefreshLocalTags\(\s*item\.tags,\s*item\.tagsAuto,/, 'sync must revisit generic and automatically generated tags without overwriting manual tags');
 assert.match(syncSource, /collectOfficeSystemUrlKeys\(merged\)/, 'same-address enterprise systems must be re-evaluated together');
 assert.match(syncSource, /applyLocalAutoTags\(current\.tags, current\.tagsAuto, item\.tagsAuto\)/, 'a replacement must not merge stale automatic tags back in');

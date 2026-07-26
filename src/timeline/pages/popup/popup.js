@@ -6,6 +6,9 @@ const timelineEmpty = $('timelineEmpty');
 const timelineContent = $('timelineContent');
 const searchEmpty = $('searchEmpty');
 const syncBtn = $('syncBtn');
+const syncProgress = $('syncProgress');
+const syncProgressText = $('syncProgressText');
+const syncProgressBar = $('syncProgressBar');
 const clearBtn = $('clearBtn');
 const quickBookmarkBtn = $('quickBookmarkBtn');
 
@@ -64,6 +67,13 @@ let duplicateIds = new Set();   // 缓存重复书签的 id 集合
 let paletteOpen = false;
 let paletteSelectedIdx = 0;
 let paletteItems = [];
+let syncProgressActive = false;
+let syncProgressOperationId = null;
+let syncProgressLastUpdatedAt = 0;
+let syncProgressLastSequence = 0;
+let syncProgressLastFinishedOperationId = null;
+let syncProgressRequestInFlight = false;
+let syncProgressRefreshPromise = null;
 
 // ===== Toast 提示 =====
 function showToast(message, type = 'info') {
@@ -74,6 +84,154 @@ function showToast(message, type = 'info') {
   setTimeout(() => {
     if (toast.parentNode) toast.remove();
   }, 2500);
+}
+
+function getSyncProgressPayload(response) {
+  if (!response || typeof response !== 'object') return null;
+  if (typeof response.status === 'string') return response;
+  if (response.syncStatus && typeof response.syncStatus === 'object') return response.syncStatus;
+  if (response.data && typeof response.data === 'object') return response.data;
+  if (response.status && typeof response.status === 'object') return response.status;
+  return null;
+}
+
+function getSyncProgressLabel(progress) {
+  const completed = Number(progress.completed);
+  const total = Number(progress.total);
+  const hasProgress = Number.isFinite(total) && total > 0;
+  const values = [String(Math.max(0, Number.isFinite(completed) ? completed : 0)), String(total)];
+
+  switch (String(progress.phase || '')) {
+    case 'start':
+      return i18n('syncProgressStarting');
+    case 'reading':
+    case 'collecting':
+      return i18n('syncProgressReading');
+    case 'merging':
+    case 'merge':
+      return hasProgress ? i18n('syncProgressMerging', values) : i18n('syncProgressRunning');
+    case 'tagging':
+      return hasProgress ? i18n('syncProgressTagging', values) : i18n('syncProgressRunning');
+    case 'clickCounts':
+    case 'click-counts':
+    case 'click_counts':
+      return hasProgress ? i18n('syncProgressClickCounts', values) : i18n('syncProgressRunning');
+    case 'saving':
+      return i18n('syncProgressSaving');
+    default:
+      return hasProgress ? i18n('syncProgressMerging', values) : i18n('syncProgressRunning');
+  }
+}
+
+function updateSyncButtonState() {
+  const isBusy = syncProgressActive || syncProgressRequestInFlight;
+  syncBtn.classList.toggle('spinning', isBusy);
+  syncBtn.disabled = isBusy;
+  syncBtn.setAttribute('aria-busy', String(isBusy));
+}
+
+function showSyncProgress(progress) {
+  const label = getSyncProgressLabel(progress);
+  const completed = Number(progress.completed);
+  const total = Number(progress.total);
+  const hasProgress = Number.isFinite(total) && total > 0;
+
+  syncProgressText.textContent = label;
+  syncProgressBar.setAttribute('aria-label', label);
+  syncProgressBar.setAttribute('aria-valuetext', label);
+  if (hasProgress) {
+    syncProgressBar.max = total;
+    syncProgressBar.value = Math.min(total, Math.max(0, Number.isFinite(completed) ? completed : 0));
+  } else {
+    syncProgressBar.removeAttribute('value');
+  }
+  syncProgress.hidden = false;
+  updateSyncButtonState();
+}
+
+function hideSyncProgress() {
+  syncProgress.hidden = true;
+  syncProgressText.textContent = '';
+  syncProgressBar.removeAttribute('value');
+  syncProgressBar.removeAttribute('aria-valuetext');
+  updateSyncButtonState();
+}
+
+function beginSyncProgress() {
+  syncProgressActive = true;
+  syncProgressOperationId = null;
+  showSyncProgress({ phase: 'start' });
+}
+
+function refreshBookmarksAfterSync() {
+  if (!syncProgressRefreshPromise) {
+    syncProgressRefreshPromise = (async () => {
+      const result = await chrome.runtime.sendMessage({ action: 'getBookmarks' });
+      if (!result?.success) {
+        showToast(i18n('loadFailedRetry'), 'error');
+        return;
+      }
+      allBookmarks = (result.bookmarks || result.data || []).map(b => ({ ...b, pinned: !!b.pinned }));
+      duplicateIds = computeDuplicates(allBookmarks);
+      await collectAllTags();
+      renderTagBar();
+      filterBookmarks(searchInput.value);
+    })()
+      .catch((err) => {
+        console.error('同步后刷新书签失败:', err);
+        showToast(i18n('loadFailedRetry'), 'error');
+      })
+      .finally(() => { syncProgressRefreshPromise = null; });
+  }
+  return syncProgressRefreshPromise;
+}
+
+function finishSyncProgress(progress) {
+  const operationId = progress?.operationId || syncProgressOperationId;
+  const status = progress?.status || 'complete';
+  const hasFinished = operationId && syncProgressLastFinishedOperationId === operationId;
+
+  syncProgressActive = false;
+  if (operationId) syncProgressOperationId = operationId;
+  if (operationId) syncProgressLastFinishedOperationId = operationId;
+  hideSyncProgress();
+
+  if (status !== 'complete' || hasFinished) return syncProgressRefreshPromise || Promise.resolve();
+  return refreshBookmarksAfterSync();
+}
+
+function handleSyncProgress(progress) {
+  if (!progress || !['running', 'complete', 'failed'].includes(progress.status)) return;
+
+  const operationId = progress.operationId || null;
+  const updatedAt = Number(progress.updatedAt);
+  const sequence = Number(progress.sequence);
+  const hasSequence = Number.isFinite(sequence);
+  if (hasSequence && sequence < syncProgressLastSequence) return;
+  if (!hasSequence && Number.isFinite(updatedAt) && updatedAt < syncProgressLastUpdatedAt) return;
+  if (syncProgressActive && syncProgressOperationId && operationId && operationId !== syncProgressOperationId) return;
+  if (!syncProgressActive && operationId && operationId === syncProgressLastFinishedOperationId) return;
+  if (hasSequence) syncProgressLastSequence = Math.max(syncProgressLastSequence, sequence);
+  if (Number.isFinite(updatedAt)) syncProgressLastUpdatedAt = Math.max(syncProgressLastUpdatedAt, updatedAt);
+
+  if (progress.status === 'running') {
+    syncProgressActive = true;
+    if (operationId) syncProgressOperationId = operationId;
+    showSyncProgress(progress);
+    return;
+  }
+
+  void finishSyncProgress(progress);
+}
+
+async function restoreSyncProgress() {
+  try {
+    const response = await chrome.runtime.sendMessage({ action: 'getSyncStatus' });
+    const progress = getSyncProgressPayload(response);
+    if (progress?.status === 'running') handleSyncProgress(progress);
+  } catch (err) {
+    console.debug('读取同步进度失败:', err);
+  }
 }
 
 // ===== 工具函数 =====
@@ -1946,32 +2104,28 @@ async function loadBookmarks() {
 
 // ===== 同步 =====
 async function handleSync() {
-  syncBtn.classList.add('spinning');
-  syncBtn.disabled = true;
+  if (syncProgressActive || syncProgressRequestInFlight) return;
+  syncProgressRequestInFlight = true;
+  beginSyncProgress();
   try {
     const result = await chrome.runtime.sendMessage({ action: 'syncAll' });
     if (result && result.success) {
       const msg = result.added > 0
         ? i18n('syncSuccessNew', [String(result.added)])
         : i18n('syncSuccessTotal', [String(result.total)]);
+      await finishSyncProgress({ status: 'complete', operationId: result.operationId });
       showToast(msg, 'success');
-      const bookmarksResult = await chrome.runtime.sendMessage({ action: 'getBookmarks' });
-      if (bookmarksResult?.success) {
-        allBookmarks = (bookmarksResult.bookmarks || []).map(b => ({ ...b, pinned: !!b.pinned }));
-        duplicateIds = computeDuplicates(allBookmarks);
-        await collectAllTags();
-        renderTagBar();
-        filterBookmarks(searchInput.value);
-      }
     } else {
+      await finishSyncProgress({ status: 'failed' });
       showToast(i18n('syncFailed'), 'error');
     }
   } catch (err) {
     console.error('同步失败:', err);
+    await finishSyncProgress({ status: 'failed' });
     showToast(i18n('syncFailedRetry'), 'error');
   } finally {
-    syncBtn.classList.remove('spinning');
-    syncBtn.disabled = false;
+    syncProgressRequestInFlight = false;
+    updateSyncButtonState();
   }
 }
 
@@ -3161,13 +3315,15 @@ document.addEventListener('mousedown', (e) => {
 
 // ===== 监听后台消息 =====
 chrome.runtime.onMessage.addListener((message) => {
-  if (message.action === 'bookmarkAdded' || message.action === 'bookmarksDeleted') {
-    loadBookmarks();
+  if (message.action === 'syncProgress') {
+    handleSyncProgress(message);
+  } else if (message.action === 'bookmarkAdded' || message.action === 'bookmarksDeleted') {
+    if (!syncProgressActive && !syncProgressRefreshPromise) loadBookmarks();
     if (message.action === 'bookmarkAdded') {
       showToast(i18n('newBookmarkDetected'), 'success');
     }
   } else if (message.action === 'tagsUpdated') {
-    loadBookmarks();
+    if (!syncProgressActive && !syncProgressRefreshPromise) loadBookmarks();
   } else if (message.action === 'openCommandPalette') {
     openCommandPalette();
   }
@@ -3184,6 +3340,7 @@ document.addEventListener('DOMContentLoaded', () => {
     setupCommandPalette();
     setupKeyboardShortcuts();
     loadSearchHistory();
+    void restoreSyncProgress();
     loadBookmarks();
     loadPreviewEnabled();
   });

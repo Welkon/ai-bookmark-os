@@ -223,6 +223,52 @@ body {
   z-index: 50;
 }
 
+.sync-progress {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 16px;
+}
+
+.sync-progress[hidden] {
+  display: none;
+}
+
+.sync-progress__text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1 1 auto;
+}
+
+.sync-progress__bar {
+  width: 92px;
+  height: 4px;
+  margin: 0;
+  appearance: none;
+  border: 0;
+  border-radius: var(--radius-full);
+  overflow: hidden;
+  background: var(--border-medium);
+  flex: 0 0 auto;
+}
+
+.sync-progress__bar::-webkit-progress-bar {
+  background: var(--border-medium);
+}
+
+.sync-progress__bar::-webkit-progress-value {
+  background: var(--accent);
+}
+
+.sync-progress__bar::-moz-progress-bar {
+  background: var(--accent);
+}
+
 .icon-btn {
   display: flex;
   align-items: center;
