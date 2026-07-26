@@ -74,6 +74,8 @@ let syncProgressLastSequence = 0;
 let syncProgressLastFinishedOperationId = null;
 let syncProgressRequestInFlight = false;
 let syncProgressRefreshPromise = null;
+let syncProgressRequestStartedAt = 0;
+let bookmarkLoadGeneration = 0;
 
 // ===== Toast 提示 =====
 function showToast(message, type = 'info') {
@@ -160,28 +162,33 @@ function hideSyncProgress() {
 function beginSyncProgress() {
   syncProgressActive = true;
   syncProgressOperationId = null;
+  syncProgressRequestStartedAt = Date.now();
+  // Background service-worker restarts reset its event sequence. The next
+  // running event establishes a fresh ordering baseline for this request.
+  syncProgressLastUpdatedAt = 0;
+  syncProgressLastSequence = 0;
   showSyncProgress({ phase: 'start' });
 }
 
 function refreshBookmarksAfterSync() {
   if (!syncProgressRefreshPromise) {
+    const requestVersion = ++bookmarkLoadGeneration;
     syncProgressRefreshPromise = (async () => {
       const result = await chrome.runtime.sendMessage({ action: 'getBookmarks' });
       if (!result?.success) {
         showToast(i18n('loadFailedRetry'), 'error');
         return;
       }
-      allBookmarks = (result.bookmarks || result.data || []).map(b => ({ ...b, pinned: !!b.pinned }));
-      duplicateIds = computeDuplicates(allBookmarks);
-      await collectAllTags();
-      renderTagBar();
-      filterBookmarks(searchInput.value);
+      await applyBookmarkSnapshot(result.bookmarks || result.data || [], requestVersion);
     })()
       .catch((err) => {
         console.error('同步后刷新书签失败:', err);
         showToast(i18n('loadFailedRetry'), 'error');
       })
-      .finally(() => { syncProgressRefreshPromise = null; });
+      .finally(() => {
+        if (requestVersion === bookmarkLoadGeneration) timelineLoading.style.display = 'none';
+        syncProgressRefreshPromise = null;
+      });
   }
   return syncProgressRefreshPromise;
 }
@@ -194,7 +201,12 @@ function finishSyncProgress(progress) {
   syncProgressActive = false;
   if (operationId) syncProgressOperationId = operationId;
   if (operationId) syncProgressLastFinishedOperationId = operationId;
+  syncProgressRequestStartedAt = 0;
   hideSyncProgress();
+
+  if (status === 'failed' && !syncProgressRequestInFlight) {
+    showToast(i18n('syncFailed'), 'error');
+  }
 
   if (status !== 'complete' || hasFinished) return syncProgressRefreshPromise || Promise.resolve();
   return refreshBookmarksAfterSync();
@@ -207,10 +219,27 @@ function handleSyncProgress(progress) {
   const updatedAt = Number(progress.updatedAt);
   const sequence = Number(progress.sequence);
   const hasSequence = Number.isFinite(sequence);
-  if (hasSequence && sequence < syncProgressLastSequence) return;
-  if (!hasSequence && Number.isFinite(updatedAt) && updatedAt < syncProgressLastUpdatedAt) return;
+  const isNewRunningOperation = progress.status === 'running'
+    && !!operationId
+    && operationId !== syncProgressOperationId;
+
+  // A manual request must first receive its own running event. This prevents
+  // a terminal event queued from an earlier operation from ending the new UI.
+  if (syncProgressActive && !syncProgressOperationId) {
+    if (progress.status !== 'running') return;
+    if (syncProgressRequestStartedAt && Number.isFinite(updatedAt) && updatedAt < syncProgressRequestStartedAt) return;
+  }
+  if (Number.isFinite(updatedAt) && updatedAt < syncProgressLastUpdatedAt) return;
   if (syncProgressActive && syncProgressOperationId && operationId && operationId !== syncProgressOperationId) return;
   if (!syncProgressActive && operationId && operationId === syncProgressLastFinishedOperationId) return;
+  if (hasSequence && sequence < syncProgressLastSequence) {
+    const canResetSequence = isNewRunningOperation
+      && !syncProgressActive
+      && Number.isFinite(updatedAt)
+      && updatedAt > syncProgressLastUpdatedAt;
+    if (!canResetSequence) return;
+    syncProgressLastSequence = 0;
+  }
   if (hasSequence) syncProgressLastSequence = Math.max(syncProgressLastSequence, sequence);
   if (Number.isFinite(updatedAt)) syncProgressLastUpdatedAt = Math.max(syncProgressLastUpdatedAt, updatedAt);
 
@@ -229,6 +258,7 @@ async function restoreSyncProgress() {
     const response = await chrome.runtime.sendMessage({ action: 'getSyncStatus' });
     const progress = getSyncProgressPayload(response);
     if (progress?.status === 'running') handleSyncProgress(progress);
+    else if (progress?.status === 'failed') showToast(i18n('syncFailed'), 'error');
   } catch (err) {
     console.debug('读取同步进度失败:', err);
   }
@@ -515,29 +545,26 @@ function computeDuplicates(list) {
 
 // 刷新书签数据：先刷新历史点击次数，再拉 storage → 重建 allTags → 渲染标签栏与时间线
 async function refreshBookmarkData({ keepFilter = true } = {}) {
+  const requestVersion = ++bookmarkLoadGeneration;
   // 从 Chrome 历史记录同步最新的点击次数
   await chrome.runtime.sendMessage({ action: 'refreshClickCounts' }).catch(() => {});
   const res = await chrome.runtime.sendMessage({ action: 'getBookmarks' });
-  if (res && res.success) {
-    allBookmarks = res.bookmarks || res.data || [];
-    await collectAllTags();
-    renderTagBar();
-    if (keepFilter) {
-      filterBookmarks(searchInput.value);
-    }
-  }
+  if (!res?.success) return false;
+  return applyBookmarkSnapshot(res.bookmarks || res.data || [], requestVersion, keepFilter);
 }
-async function collectAllTags() {
-  allTags.clear();
-  for (const item of allBookmarks) {
+async function collectAllTags(bookmarks = allBookmarks, apply = true) {
+  const nextTags = new Map();
+  for (const item of bookmarks) {
     for (const tag of visibleTags(item.tags)) {
-        if (!allTags.has(tag)) {
+        if (!nextTags.has(tag)) {
           const color = await getTagColor(tag);
-          allTags.set(tag, { count: 0, color });
+          nextTags.set(tag, { count: 0, color });
         }
-        allTags.get(tag).count++;
+        nextTags.get(tag).count++;
     }
   }
+  if (apply && bookmarks === allBookmarks) allTags = nextTags;
+  return nextTags;
 }
 
 function renderTagBar() {
@@ -2068,7 +2095,28 @@ function filterBookmarks(query) {
 }
 
 // ===== 加载书签数据 =====
+async function applyBookmarkSnapshot(bookmarks, requestVersion, keepFilter = true) {
+  const nextBookmarks = (bookmarks || []).map(b => ({ ...b, pinned: !!b.pinned }));
+  const nextTags = await collectAllTags(nextBookmarks, false);
+  if (requestVersion !== bookmarkLoadGeneration) return false;
+
+  allBookmarks = nextBookmarks;
+  duplicateIds = computeDuplicates(allBookmarks);
+  allTags = nextTags;
+  renderTagBar();
+  if (keepFilter) {
+    try {
+      filterBookmarks(searchInput.value);
+    } catch (innerErr) {
+      console.error('filterBookmarks 失败，回退到 renderTimeline:', innerErr);
+      renderTimeline(allBookmarks);
+    }
+  }
+  return true;
+}
+
 async function loadBookmarks() {
+  const requestVersion = ++bookmarkLoadGeneration;
   timelineLoading.style.display = 'flex';
   timelineContent.style.display = 'none';
   timelineEmpty.style.display = 'none';
@@ -2077,28 +2125,17 @@ async function loadBookmarks() {
   try {
     const result = await chrome.runtime.sendMessage({ action: 'getBookmarks' });
     if (result && result.success) {
-      allBookmarks = (result.bookmarks || []).map(b => ({
-        ...b,
-        pinned: !!b.pinned
-      }));
-      duplicateIds = computeDuplicates(allBookmarks);
-      await collectAllTags();
-      renderTagBar();
-      // 防御性：包一层 try/catch，避免 createBookmarkElement 等内部异常导致 renderQueue 为空
-      try {
-        filterBookmarks(searchInput.value);
-      } catch (innerErr) {
-        console.error('filterBookmarks 失败，回退到 renderTimeline:', innerErr);
-        renderTimeline(allBookmarks);
-      }
-    } else {
+      await applyBookmarkSnapshot(result.bookmarks || [], requestVersion);
+    } else if (requestVersion === bookmarkLoadGeneration) {
       showToast(i18n('loadFailed'), 'error');
     }
   } catch (err) {
-    console.error('加载书签失败:', err);
-    showToast(i18n('loadFailedRetry'), 'error');
+    if (requestVersion === bookmarkLoadGeneration) {
+      console.error('加载书签失败:', err);
+      showToast(i18n('loadFailedRetry'), 'error');
+    }
   } finally {
-    timelineLoading.style.display = 'none';
+    if (requestVersion === bookmarkLoadGeneration) timelineLoading.style.display = 'none';
   }
 }
 

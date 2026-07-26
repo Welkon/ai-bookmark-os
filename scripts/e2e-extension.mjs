@@ -825,6 +825,44 @@ try {
   );
   await syncProgressPopup.close();
 
+  await worker.evaluate(() => {
+    const originalEnrichClickCounts = enrichClickCounts;
+    globalThis.__e2eWorkspaceSyncProgressProbe = { entered: false };
+    enrichClickCounts = async (bookmarks, concurrency, onProgress) => {
+      if (syncProgressState.status !== 'running') {
+        return originalEnrichClickCounts(bookmarks, concurrency, onProgress);
+      }
+      globalThis.__e2eWorkspaceSyncProgressProbe.entered = true;
+      onProgress?.(0, bookmarks.length);
+      await new Promise(resolve => setTimeout(resolve, 900));
+      try {
+        return await originalEnrichClickCounts(bookmarks, concurrency, onProgress);
+      } finally {
+        enrichClickCounts = originalEnrichClickCounts;
+      }
+    };
+  });
+  const syncProgressWorkspace = await openExtensionPage(context, extensionId, 'pages/standalone/standalone.html', pageErrors);
+  await syncProgressWorkspace.setViewportSize({ width: 1440, height: 900 });
+  await syncProgressWorkspace.locator('.sa-bookmark-item').first().waitFor({ timeout: 10000 });
+  await syncProgressWorkspace.locator('#saSyncBtn').click();
+  await syncProgressWorkspace.waitForFunction(() => {
+    const progress = document.getElementById('saSyncProgress');
+    const text = document.getElementById('saSyncProgressText')?.textContent || '';
+    return progress && !progress.hidden && /更新访问记录|Updating visit data/i.test(text);
+  }, undefined, { timeout: 15000 });
+  assert.equal(await syncProgressWorkspace.locator('#saSyncBtn').isDisabled(), true, 'workspace sync button must be disabled while progress is active');
+  assert.ok(await syncProgressWorkspace.locator('.sa-bookmark-item').count() > 0, 'workspace sync progress must retain the previous complete bookmark view');
+  await syncProgressWorkspace.screenshot({ path: join(artifactsPath, 'sync-progress-workspace.png'), fullPage: true });
+  await syncProgressWorkspace.locator('#saSyncProgress').waitFor({ state: 'hidden', timeout: 20000 });
+  assert.equal(await syncProgressWorkspace.locator('#saSyncBtn').isDisabled(), false, 'workspace sync button must recover after completion');
+  assert.equal(
+    await worker.evaluate(() => globalThis.__e2eWorkspaceSyncProgressProbe?.entered === true),
+    true,
+    'workspace sync progress fixture did not reach the delayed click-count phase',
+  );
+  await syncProgressWorkspace.close();
+
   const pages = [
     ['workspace', 'pages/standalone/standalone.html', /Synthetic|书签|Bookmark/i],
     ['bookmark navigation', 'ai/bookmark-nav.html', /Synthetic React/i],

@@ -176,6 +176,11 @@ for (const [name, source, html, progressId, textId, barId, buttonId] of [
   assert.match(source, /action\s*===\s*['\"]syncProgress['\"]/);
   assert.match(source, /handleSyncProgress\(/);
   assert.match(source, /syncProgressRefreshPromise/);
+  assert.match(source, /syncProgressRequestStartedAt/);
+  assert.match(source, /const canResetSequence = isNewRunningOperation/);
+  assert.match(source, /updatedAt > syncProgressLastUpdatedAt/);
+  assert.match(source, /status === 'failed' && !syncProgressRequestInFlight/);
+  assert.match(source, /bookmarkLoadGeneration/);
   assert.match(
     source,
     buttonId === 'syncBtn' ? /syncBtn\.disabled\s*=\s*isBusy/ : /saSyncBtn\.disabled\s*=\s*isBusy/,
@@ -210,7 +215,10 @@ const popupProgress = makeElement();
 const popupProgressText = makeElement();
 const popupProgressBar = makeElement();
 const popupMessages = [];
+const popupToasts = [];
+let popupNow = 1000;
 const popupContext = {
+  Date: { now: () => popupNow },
   Promise,
   Number,
   String,
@@ -231,8 +239,12 @@ const popupContext = {
   syncProgressLastFinishedOperationId: null,
   syncProgressRequestInFlight: false,
   syncProgressRefreshPromise: null,
+  syncProgressRequestStartedAt: 0,
+  bookmarkLoadGeneration: 0,
+  timelineLoading: { style: { display: '' } },
   i18n(key, values = []) { return `${key}:${values.join('/')}`; },
-  showToast() {},
+  showToast(message, type) { popupToasts.push({ message, type }); },
+  async applyBookmarkSnapshot() {},
   computeDuplicates() { return new Set(); },
   async collectAllTags() {},
   renderTagBar() {},
@@ -251,6 +263,7 @@ const popupContext = {
 vm.createContext(popupContext);
 vm.runInContext(`${popupProgressUiSource}\nthis.helpers = {
   getSyncProgressPayload,
+  beginSyncProgress,
   handleSyncProgress,
   finishSyncProgress,
 };`, popupContext);
@@ -292,6 +305,138 @@ assert.equal(popupSyncBtn.disabled, false);
 assert.equal(popupMessages.filter(item => item.action === 'getBookmarks').length, 1, 'completed sync must refresh the complete snapshot once');
 await popupContext.helpers.finishSyncProgress({ status: 'complete', operationId: 'sync-1' });
 assert.equal(popupMessages.filter(item => item.action === 'getBookmarks').length, 1, 'duplicate completion events must not refresh twice');
+
+popupContext.helpers.handleSyncProgress({
+  action: 'syncProgress',
+  status: 'failed',
+  operationId: 'sync-remote-failed',
+  phase: 'merging',
+  completed: 4,
+  total: 10,
+  updatedAt: 101,
+  sequence: 11,
+});
+assert.deepEqual(popupToasts.at(-1), { message: 'syncFailed:', type: 'error' }, 'a non-initiating page must surface sync failures');
+
+popupContext.syncProgressOperationId = 'sync-B';
+popupContext.syncProgressLastFinishedOperationId = 'sync-B';
+popupContext.syncProgressLastUpdatedAt = 210;
+popupContext.syncProgressLastSequence = 31;
+popupContext.helpers.handleSyncProgress({
+  action: 'syncProgress',
+  status: 'running',
+  operationId: 'sync-old-A',
+  phase: 'merging',
+  completed: 20,
+  total: 100,
+  updatedAt: 100,
+  sequence: 20,
+});
+assert.equal(popupProgress.hidden, true, 'an old operation must not reopen completed progress');
+assert.equal(popupSyncBtn.disabled, false, 'an old operation must not disable the completed sync button');
+assert.equal(popupContext.syncProgressOperationId, 'sync-B');
+
+// A service-worker restart restarts its sequence counter. A new manual sync
+// must accept that new operation, while ignoring a stale completion that was
+// queued before the user clicked sync.
+popupContext.helpers.beginSyncProgress();
+popupContext.helpers.handleSyncProgress({
+  action: 'syncProgress',
+  status: 'complete',
+  operationId: 'sync-stale',
+  phase: 'complete',
+  completed: 100,
+  total: 100,
+  updatedAt: 999,
+  sequence: 11,
+});
+assert.equal(popupProgress.hidden, false, 'a stale completion must not end a new manual sync');
+assert.equal(popupSyncBtn.disabled, true, 'a stale completion must not re-enable the button');
+popupNow = 1001;
+popupContext.helpers.handleSyncProgress({
+  action: 'syncProgress',
+  status: 'running',
+  operationId: 'sync-worker-restarted',
+  phase: 'merging',
+  completed: 4,
+  total: 10,
+  updatedAt: 1001,
+  sequence: 1,
+});
+assert.equal(popupProgressBar.value, 4, 'a new operation must accept a reset background sequence');
+assert.equal(popupProgressText.textContent, 'syncProgressMerging:4/10');
+
+const popupSnapshotSource = getSourceBlock(
+  popupSource,
+  'async function applyBookmarkSnapshot(',
+  'async function loadBookmarks()',
+  'popup snapshot application',
+);
+let resolveOldPopupTags;
+const oldPopupTags = new Promise(resolve => { resolveOldPopupTags = resolve; });
+const popupSnapshotContext = {
+  Promise,
+  Map,
+  Set,
+  console: { error() {} },
+  bookmarkLoadGeneration: 1,
+  allBookmarks: [],
+  allTags: new Map(),
+  duplicateIds: new Set(),
+  searchInput: { value: '' },
+  async collectAllTags(bookmarks) {
+    return bookmarks[0]?.id === 'old' ? oldPopupTags : new Map([['new-tag', { count: 1, color: '#000' }]]);
+  },
+  computeDuplicates() { return new Set(); },
+  renderTagBar() {},
+  filterBookmarks() {},
+  renderTimeline() {},
+};
+vm.createContext(popupSnapshotContext);
+vm.runInContext(`${popupSnapshotSource}\nthis.applyBookmarkSnapshot = applyBookmarkSnapshot;`, popupSnapshotContext);
+const oldPopupSnapshot = popupSnapshotContext.applyBookmarkSnapshot([{ id: 'old' }], 1);
+popupSnapshotContext.bookmarkLoadGeneration = 2;
+const newPopupSnapshot = popupSnapshotContext.applyBookmarkSnapshot([{ id: 'new' }], 2);
+assert.equal(await newPopupSnapshot, true);
+resolveOldPopupTags(new Map([['old-tag', { count: 1, color: '#000' }]]));
+assert.equal(await oldPopupSnapshot, false);
+assert.deepEqual([...popupSnapshotContext.allBookmarks].map(item => item.id), ['new'], 'a late initial snapshot must not overwrite the completed sync snapshot');
+
+const standaloneRefreshSource = getSourceBlock(
+  standaloneSource,
+  'async function refreshBookmarkData(',
+  'let clickCountBackgroundRefreshInFlight',
+  'workspace snapshot refresh',
+);
+let resolveOldWorkspaceBookmarks;
+const oldWorkspaceBookmarks = new Promise(resolve => { resolveOldWorkspaceBookmarks = resolve; });
+let workspaceFetchCount = 0;
+const workspaceSnapshotContext = {
+  Promise,
+  Map,
+  Set,
+  bookmarkLoadGeneration: 0,
+  allBookmarks: [],
+  allTags: new Map(),
+  duplicateIds: new Set(),
+  saSearchInput: { value: '' },
+  fetchBookmarks() {
+    workspaceFetchCount += 1;
+    return workspaceFetchCount === 1 ? oldWorkspaceBookmarks : Promise.resolve([{ id: 'new-workspace' }]);
+  },
+  async collectAllTags(bookmarks) { return new Map([[bookmarks[0]?.id || '', { count: 1, color: '#000' }]]); },
+  computeDuplicates() { return new Set(); },
+  renderTagFilter() {},
+  filterBookmarks() {},
+};
+vm.createContext(workspaceSnapshotContext);
+vm.runInContext(`${standaloneRefreshSource}\nthis.refreshBookmarkData = refreshBookmarkData;`, workspaceSnapshotContext);
+const oldWorkspaceRefresh = workspaceSnapshotContext.refreshBookmarkData();
+const newWorkspaceRefresh = workspaceSnapshotContext.refreshBookmarkData();
+assert.equal(await newWorkspaceRefresh, true);
+resolveOldWorkspaceBookmarks([{ id: 'old-workspace' }]);
+assert.equal(await oldWorkspaceRefresh, false);
+assert.deepEqual([...workspaceSnapshotContext.allBookmarks].map(item => item.id), ['new-workspace'], 'a late workspace snapshot must not overwrite the completed sync snapshot');
 
 for (const key of [
   'syncProgressStarting',

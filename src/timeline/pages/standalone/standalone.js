@@ -87,6 +87,8 @@ let syncProgressLastSequence = 0;
 let syncProgressLastFinishedOperationId = null;
 let syncProgressRequestInFlight = false;
 let syncProgressRefreshPromise = null;
+let syncProgressRequestStartedAt = 0;
+let bookmarkLoadGeneration = 0;
 
 // MDI 多窗口
 let mdiManager = null;
@@ -215,6 +217,11 @@ function hideSyncProgress() {
 function beginSyncProgress() {
   syncProgressActive = true;
   syncProgressOperationId = null;
+  syncProgressRequestStartedAt = Date.now();
+  // Background service-worker restarts reset its event sequence. The next
+  // running event establishes a fresh ordering baseline for this request.
+  syncProgressLastUpdatedAt = 0;
+  syncProgressLastSequence = 0;
   showSyncProgress({ phase: 'start' });
 }
 
@@ -238,7 +245,12 @@ function finishSyncProgress(progress) {
   syncProgressActive = false;
   if (operationId) syncProgressOperationId = operationId;
   if (operationId) syncProgressLastFinishedOperationId = operationId;
+  syncProgressRequestStartedAt = 0;
   hideSyncProgress();
+
+  if (status === 'failed' && !syncProgressRequestInFlight) {
+    showToast(i18n('syncFailed'), 'error');
+  }
 
   if (status !== 'complete' || hasFinished) return syncProgressRefreshPromise || Promise.resolve();
   return refreshBookmarksAfterSync();
@@ -251,10 +263,27 @@ function handleSyncProgress(progress) {
   const updatedAt = Number(progress.updatedAt);
   const sequence = Number(progress.sequence);
   const hasSequence = Number.isFinite(sequence);
-  if (hasSequence && sequence < syncProgressLastSequence) return;
-  if (!hasSequence && Number.isFinite(updatedAt) && updatedAt < syncProgressLastUpdatedAt) return;
+  const isNewRunningOperation = progress.status === 'running'
+    && !!operationId
+    && operationId !== syncProgressOperationId;
+
+  // A manual request must first receive its own running event. This prevents
+  // a terminal event queued from an earlier operation from ending the new UI.
+  if (syncProgressActive && !syncProgressOperationId) {
+    if (progress.status !== 'running') return;
+    if (syncProgressRequestStartedAt && Number.isFinite(updatedAt) && updatedAt < syncProgressRequestStartedAt) return;
+  }
+  if (Number.isFinite(updatedAt) && updatedAt < syncProgressLastUpdatedAt) return;
   if (syncProgressActive && syncProgressOperationId && operationId && operationId !== syncProgressOperationId) return;
   if (!syncProgressActive && operationId && operationId === syncProgressLastFinishedOperationId) return;
+  if (hasSequence && sequence < syncProgressLastSequence) {
+    const canResetSequence = isNewRunningOperation
+      && !syncProgressActive
+      && Number.isFinite(updatedAt)
+      && updatedAt > syncProgressLastUpdatedAt;
+    if (!canResetSequence) return;
+    syncProgressLastSequence = 0;
+  }
   if (hasSequence) syncProgressLastSequence = Math.max(syncProgressLastSequence, sequence);
   if (Number.isFinite(updatedAt)) syncProgressLastUpdatedAt = Math.max(syncProgressLastUpdatedAt, updatedAt);
 
@@ -273,6 +302,7 @@ async function restoreSyncProgress() {
     const response = await chrome.runtime.sendMessage({ action: 'getSyncStatus' });
     const progress = getSyncProgressPayload(response);
     if (progress?.status === 'running') handleSyncProgress(progress);
+    else if (progress?.status === 'failed') showToast(i18n('syncFailed'), 'error');
   } catch (err) {
     console.debug('读取同步进度失败:', err);
   }
@@ -498,12 +528,17 @@ async function fetchBookmarks() {
 }
 
 async function refreshBookmarkData({ keepFilter = true } = {}) {
+  const requestVersion = ++bookmarkLoadGeneration;
   const bookmarks = await fetchBookmarks();
+  const nextTags = await collectAllTags(bookmarks, false);
+  if (requestVersion !== bookmarkLoadGeneration) return false;
+
   allBookmarks = bookmarks;
   duplicateIds = computeDuplicates(allBookmarks);
-  await collectAllTags();
+  allTags = nextTags;
   renderTagFilter();
   filterBookmarks(saSearchInput.value);
+  return true;
 }
 
 let clickCountBackgroundRefreshInFlight = null;
@@ -604,17 +639,19 @@ async function updateBookmark(id, changes) {
 // getTagColor 复用 smart-tagger.js 的全局实现（读 tag_colors 存储 → DOMAIN_RULES 预设色 →
 // 求和哈希 hsl(h,60%,50%)），与 popup 等页面共用同一套取色逻辑，保证同标签跨页面颜色一致。
 
-async function collectAllTags() {
-  allTags.clear();
-  for (const item of allBookmarks) {
+async function collectAllTags(bookmarks = allBookmarks, apply = true) {
+  const nextTags = new Map();
+  for (const item of bookmarks) {
     for (const tag of visibleTags(item.tags)) {
-        if (!allTags.has(tag)) {
+        if (!nextTags.has(tag)) {
           const color = await getTagColor(tag);
-          allTags.set(tag, { count: 0, color });
+          nextTags.set(tag, { count: 0, color });
         }
-        allTags.get(tag).count++;
+        nextTags.get(tag).count++;
     }
   }
+  if (apply && bookmarks === allBookmarks) allTags = nextTags;
+  return nextTags;
 }
 
 function renderTagFilter() {
