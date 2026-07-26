@@ -1,20 +1,25 @@
 :root {
-  --nav-page: #f4f7fb;
-  --nav-surface: #ffffff;
-  --nav-surface-muted: #f8fafc;
-  --nav-surface-hover: #f1f6fc;
-  --nav-border: #dce5ef;
-  --nav-border-strong: #c7d5e4;
-  --nav-text: #172131;
-  --nav-muted: #637284;
-  --nav-faint: #8795a6;
-  --nav-accent: #1683e8;
-  --nav-accent-strong: #076cc8;
-  --nav-accent-soft: #e7f3ff;
+  --nav-page-gradient:
+    radial-gradient(1200px 560px at 12% -8%, rgba(186, 220, 255, 0.55), transparent 58%),
+    radial-gradient(900px 480px at 88% 0%, rgba(214, 230, 255, 0.42), transparent 52%),
+    linear-gradient(180deg, #f8fbff 0%, #edf4fb 46%, #f4f7fb 100%);
+  --nav-surface: rgba(255, 255, 255, 0.58);
+  --nav-surface-strong: rgba(255, 255, 255, 0.78);
+  --nav-surface-muted: rgba(245, 249, 255, 0.48);
+  --nav-surface-hover: rgba(255, 255, 255, 0.78);
+  --nav-border: rgba(255, 255, 255, 0.72);
+  --nav-border-strong: rgba(112, 137, 171, 0.26);
+  --nav-text: #1d1d1f;
+  --nav-muted: #53606f;
+  --nav-faint: #7b8796;
+  --nav-accent: #0a84ff;
+  --nav-accent-strong: #0077ed;
+  --nav-accent-soft: rgba(10, 132, 255, 0.12);
   --nav-success: #167d62;
-  --nav-radius: 8px;
-  --nav-shadow: 0 12px 30px rgba(31, 56, 84, 0.08);
-  --nav-shadow-sm: 0 4px 12px rgba(31, 56, 84, 0.06);
+  --nav-radius: 18px;
+  --nav-panel-radius: 24px;
+  --nav-shadow: 0 18px 48px rgba(35, 66, 112, 0.12), 0 1px 0 rgba(255, 255, 255, 0.82) inset;
+  --nav-shadow-sm: 0 10px 28px rgba(35, 66, 112, 0.08), 0 1px 0 rgba(255, 255, 255, 0.78) inset;
   color-scheme: light;
 }
 
@@ -32,12 +37,23 @@ body,
 body {
   margin: 0;
   color: var(--nav-text);
-  background: var(--nav-page);
+  background: var(--nav-page-gradient);
   font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
   font-size: 14px;
   line-height: 1.5;
   letter-spacing: 0;
   -webkit-font-smoothing: antialiased;
+}
+
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background:
+    linear-gradient(125deg, rgba(255, 255, 255, 0.72), rgba(214, 233, 255, 0.28) 42%, transparent 76%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.42), rgba(238, 244, 251, 0));
 }
 
 button,
@@ -47,6 +63,10 @@ input {
 
 button {
   cursor: pointer;
+}
+
+button:not(:disabled):active {
+  transform: scale(0.97);
 }
 
 button:focus-visible,
@@ -71,7 +91,7 @@ input:focus-visible {
   gap: 10px;
   margin: -18px 0 16px;
   padding: 18px 0 12px;
-  background: linear-gradient(to bottom, var(--nav-page) 86%, transparent);
+  background: linear-gradient(to bottom, rgba(248, 251, 255, 0.96) 84%, rgba(248, 251, 255, 0));
 }
 
 .bookmark-nav-header,
@@ -83,6 +103,13 @@ input:focus-visible {
   border: 1px solid var(--nav-border);
   background: var(--nav-surface);
   box-shadow: var(--nav-shadow-sm);
+  backdrop-filter: saturate(180%) blur(20px);
+  -webkit-backdrop-filter: saturate(180%) blur(20px);
+}
+
+.bookmark-nav-header,
+.bookmark-nav-toolbar {
+  background: var(--nav-surface-strong);
 }
 
 .bookmark-nav-header {
@@ -93,7 +120,7 @@ input:focus-visible {
   min-width: 0;
   min-height: 66px;
   padding: 10px 12px;
-  border-radius: 10px;
+  border-radius: var(--nav-panel-radius);
 }
 
 .bookmark-nav-brand,
@@ -121,10 +148,10 @@ input:focus-visible {
   height: 38px;
   flex: 0 0 auto;
   place-items: center;
-  border-radius: 8px;
+  border-radius: 10px;
   color: #ffffff;
-  background: var(--nav-accent);
-  box-shadow: inset 0 -1px 0 rgba(0, 0, 0, 0.12);
+  background: linear-gradient(180deg, color-mix(in srgb, var(--nav-accent) 82%, white), var(--nav-accent-strong));
+  box-shadow: 0 10px 26px rgba(93, 151, 255, 0.22), inset 0 1px 0 rgba(255, 255, 255, 0.28);
 }
 
 .bookmark-nav-brand > div:last-child {
@@ -259,7 +286,7 @@ input:focus-visible {
   min-width: 0;
   gap: 10px;
   padding: 8px;
-  border-radius: 10px;
+  border-radius: var(--nav-panel-radius);
 }
 
 .bookmark-nav-search {
@@ -724,22 +751,26 @@ input:focus-visible {
 
 .bookmark-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(min(100%, 242px), 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 260px), 1fr));
+  grid-auto-rows: max-content;
   gap: 12px;
-  align-items: stretch;
+  align-content: start;
+  align-items: start;
 }
 
 .bookmark-card {
-  min-height: 148px;
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  padding: 13px;
+  gap: 8px;
+  align-self: start;
+  padding: 12px;
   overflow: hidden;
   border: 1px solid var(--nav-border);
   border-radius: var(--nav-radius);
   background: var(--nav-surface);
   box-shadow: var(--nav-shadow-sm);
+  backdrop-filter: saturate(170%) blur(18px);
+  -webkit-backdrop-filter: saturate(170%) blur(18px);
   cursor: pointer;
   outline: none;
   transition: border-color 140ms ease, box-shadow 140ms ease, transform 140ms ease;
@@ -747,40 +778,47 @@ input:focus-visible {
 
 .bookmark-card:hover,
 .bookmark-card:focus-visible {
-  border-color: #acd5f6;
-  box-shadow: 0 8px 18px rgba(31, 56, 84, 0.1);
+  border-color: color-mix(in srgb, var(--nav-accent) 20%, var(--nav-border));
+  box-shadow: var(--nav-shadow);
   transform: translateY(-1px);
 }
 
+.bookmark-card:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--nav-accent) 70%, white);
+  outline-offset: 2px;
+}
+
 .bookmark-card:active {
-  transform: translateY(0);
+  transform: scale(0.98);
+  transition-duration: 100ms;
 }
 
 .bookmark-card__head {
   min-width: 0;
-  align-items: flex-start;
-  gap: 9px;
+  align-items: center;
+  gap: 8px;
 }
 
 .bookmark-card__favicon {
-  width: 30px;
-  height: 30px;
+  width: 20px;
+  height: 20px;
   display: grid;
   flex: 0 0 auto;
   place-items: center;
   overflow: hidden;
-  border: 1px solid #d9e4ef;
-  border-radius: 7px;
+  border: 0;
+  border-radius: 50%;
   color: #2a6296;
-  background: #eff5fa;
-  font-size: 12px;
-  font-weight: 760;
+  background: rgba(236, 243, 251, 0.78);
+  font-size: 10px;
+  font-weight: 600;
   line-height: 1;
 }
 
 .bookmark-card__favicon img {
-  width: 17px;
-  height: 17px;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
   object-fit: contain;
 }
 
@@ -790,19 +828,19 @@ input:focus-visible {
 }
 
 .bookmark-card__title {
-  display: -webkit-box;
+  display: block;
   margin: 0;
   overflow: hidden;
   color: var(--nav-text);
   font-size: 13px;
-  font-weight: 700;
+  font-weight: 500;
   line-height: 1.35;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .bookmark-card__domain {
-  margin: 3px 0 0;
+  margin: 2px 0 0;
   overflow: hidden;
   color: var(--nav-faint);
   font-size: 11px;
@@ -838,26 +876,25 @@ input:focus-visible {
 }
 
 .bookmark-card__tags {
-  min-height: 23px;
-  gap: 6px;
+  min-height: 0;
+  gap: 4px;
   margin-top: auto;
-  overflow: hidden;
-  white-space: nowrap;
+  flex-wrap: wrap;
 }
 
 .bookmark-card__tag {
   min-width: 0;
-  min-height: 23px;
   display: inline-flex;
   align-items: center;
-  gap: 5px;
+  gap: 3px;
   flex: 0 1 auto;
-  padding: 0 7px;
+  padding: 2px 6px;
   overflow: hidden;
   border: 1px solid transparent;
-  border-radius: 999px;
-  font-size: 11px;
-  font-weight: 650;
+  border-radius: 8px;
+  background: color-mix(in srgb, currentColor 12%, transparent);
+  font-size: 10px;
+  font-weight: 500;
   line-height: 1;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -875,6 +912,11 @@ input:focus-visible {
 
 .bookmark-card__tag.is-active {
   box-shadow: 0 0 0 2px color-mix(in srgb, currentColor 20%, transparent);
+}
+
+.bookmark-card__tag-dot {
+  width: 6px;
+  height: 6px;
 }
 
 .bookmark-nav-state {
@@ -909,10 +951,11 @@ input:focus-visible {
 }
 
 .bookmark-skeleton {
-  min-height: 148px;
+  min-height: 124px;
   overflow: hidden;
   border: 1px solid var(--nav-border);
   border-radius: var(--nav-radius);
+  box-shadow: var(--nav-shadow-sm);
   background:
     linear-gradient(90deg, rgba(232, 239, 246, 0) 0%, rgba(232, 239, 246, 0.85) 50%, rgba(232, 239, 246, 0) 100%) 0 0 / 200% 100%,
     linear-gradient(#edf2f7 0 0) 14px 14px / 30px 30px no-repeat,
@@ -1045,5 +1088,27 @@ input:focus-visible {
     animation-duration: 1ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: 1ms !important;
+  }
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  .bookmark-nav-header,
+  .bookmark-nav-toolbar,
+  .bookmark-folder-sidebar,
+  .bookmark-results-head,
+  .bookmark-nav-meta-notice,
+  .bookmark-nav-state,
+  .bookmark-card {
+    background: #ffffff;
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
+}
+
+@media (prefers-contrast: more) {
+  :root {
+    --nav-surface: rgba(255, 255, 255, 0.96);
+    --nav-surface-strong: #ffffff;
+    --nav-border: rgba(28, 28, 30, 0.34);
   }
 }

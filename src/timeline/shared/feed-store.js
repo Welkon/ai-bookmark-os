@@ -30,7 +30,8 @@
     const mutation = previous.catch(() => {}).then(async () => {
       const stored = await chrome.storage.local.get(key);
       const next = await updater(stored[key]);
-      if (next !== undefined) await chrome.storage.local.set({ [key]: next });
+      if (next === undefined) await chrome.storage.local.remove(key);
+      else await chrome.storage.local.set({ [key]: next });
       return next;
     });
     mutationQueues.set(key, mutation);
@@ -99,7 +100,6 @@
     await mutateStorage(FEEDS_KEY, (stored) => (stored || []).filter(f => f.id !== id));
     // 经队列串行化后彻底删除条目 key，避免残留空的 rss_items_<id>（旧实现写入 [] 只是清空未删除）。
     await mutateStorage(ITEMS_KEY_PREFIX + id, () => undefined);
-    await chrome.storage.local.remove(ITEMS_KEY_PREFIX + id);
     return { success: true };
   }
 
@@ -138,8 +138,9 @@
 
   // 增量写入：按 guid 去重，返回新增的条目数组
   async function upsertItems(feedId, newItems, maxItems) {
-    let added;
-    await mutateStorage(ITEMS_KEY_PREFIX + feedId, (stored) => {
+    let added = [];
+    await mutateStorage(ITEMS_KEY_PREFIX + feedId, async (stored) => {
+      if (!await getFeed(feedId)) return undefined;
       const existing = (stored || []).slice(); const guidSet = new Set(existing.map(i => i.guid)); added = [];
       for (const it of newItems) {
         if (!it.guid || guidSet.has(it.guid)) continue;

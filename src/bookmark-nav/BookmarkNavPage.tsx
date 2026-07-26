@@ -400,7 +400,10 @@ export function BookmarkNavPage() {
   const [expandedFolderIds, setExpandedFolderIds] = useState<Set<string>>(() => new Set());
   const [metaUnavailable, setMetaUnavailable] = useState(false);
   const tagTriggerRef = useRef<HTMLButtonElement>(null);
-  const metaRequestId = useRef(0);
+  const metaQueue = useRef<string[]>([]);
+  const queuedMetaUrls = useRef(new Set<string>());
+  const activeMetaWorkers = useRef(0);
+  const metaLoaderMounted = useRef(true);
   const bookmarkRefreshTimer = useRef<number | null>(null);
 
   const loadBookmarks = useCallback(async () => {
@@ -472,6 +475,30 @@ export function BookmarkNavPage() {
     return demoTags.length ? demoTags : inferTags(bookmark);
   }, [isDemo, timelineTags]);
 
+  const drainMetaQueue = useCallback(function drain(): void {
+    while (metaLoaderMounted.current && activeMetaWorkers.current < 3 && metaQueue.current.length > 0) {
+      const url = metaQueue.current.shift();
+      if (!url) continue;
+      activeMetaWorkers.current += 1;
+      void fetchBookmarkMeta(url)
+        .then((meta) => {
+          if (!metaLoaderMounted.current) return;
+          if (meta) setBookmarkMeta((current) => ({ ...current, [url]: meta }));
+          else setMetaUnavailable(true);
+        })
+        .finally(() => {
+          queuedMetaUrls.current.delete(url);
+          activeMetaWorkers.current -= 1;
+          drain();
+        });
+    }
+  }, []);
+
+  useEffect(() => {
+    metaLoaderMounted.current = true;
+    return () => { metaLoaderMounted.current = false; };
+  }, []);
+
   useEffect(() => {
     if (!canUseBookmarksApi()) return;
     const refresh = () => {
@@ -516,7 +543,7 @@ export function BookmarkNavPage() {
     return bookmarks.filter((bookmark) => {
       if (selectedIds && !selectedIds.has(bookmark.id)) return false;
       const label = getBookmarkLabel(bookmark);
-      const meta = bookmarkMeta[bookmark.id];
+      const meta = bookmarkMeta[bookmark.url];
       const enrichment = buildBookmarkEnrichment(bookmark, label, meta, getBookmarkTags(bookmark));
       const tags = enrichment.tags;
       if (activeTags.length > 0) {
@@ -543,38 +570,25 @@ export function BookmarkNavPage() {
 
   useEffect(() => {
     if (isDemo || status !== 'ready' || typeof chrome === 'undefined' || !chrome.runtime?.sendMessage) return;
+    const capacity = Math.max(0, 18 - queuedMetaUrls.current.size);
     const targets = visibleBookmarks
       .filter((bookmark) => {
         const label = getBookmarkLabel(bookmark);
-        return !label?.summary && !bookmarkMeta[bookmark.id];
+        return !label?.summary
+          && !bookmarkMeta[bookmark.url]
+          && !queuedMetaUrls.current.has(bookmark.url)
+          && (META_FAILURE_UNTIL.get(bookmark.url) ?? 0) <= Date.now();
       })
-      .slice(0, 18);
+      .slice(0, capacity);
     if (!targets.length) return;
 
-    let cancelled = false;
-    const requestId = ++metaRequestId.current;
-    let cursor = 0;
-    const workers = Array.from({ length: 3 }, async () => {
-      while (!cancelled && cursor < targets.length) {
-        const bookmark = targets[cursor++];
-        try {
-          const meta = await fetchBookmarkMeta(bookmark.url);
-          if (!cancelled && requestId === metaRequestId.current && meta) {
-            setBookmarkMeta((current) => ({ ...current, [bookmark.id]: meta }));
-          } else if (!cancelled && requestId === metaRequestId.current && !meta) {
-            setMetaUnavailable(true);
-          }
-        } catch {
-          setMetaUnavailable(true);
-        }
-      }
-    });
-    void Promise.all(workers);
-    return () => {
-      cancelled = true;
-      metaRequestId.current += 1;
-    };
-  }, [bookmarkMeta, getBookmarkLabel, isDemo, status, visibleBookmarks]);
+    for (const bookmark of targets) {
+      if (queuedMetaUrls.current.has(bookmark.url)) continue;
+      queuedMetaUrls.current.add(bookmark.url);
+      metaQueue.current.push(bookmark.url);
+    }
+    drainMetaQueue();
+  }, [bookmarkMeta, drainMetaQueue, getBookmarkLabel, isDemo, status, visibleBookmarks]);
 
   const toggleFolder = useCallback((id: string) => {
     setExpandedFolderIds((current) => {
@@ -870,7 +884,7 @@ export function BookmarkNavPage() {
             <section className="bookmark-grid" aria-label="书签列表">
               {visibleBookmarks.map((bookmark) => {
                 const label = getBookmarkLabel(bookmark);
-                const meta = bookmarkMeta[bookmark.id];
+                const meta = bookmarkMeta[bookmark.url];
                 const enrichment = buildBookmarkEnrichment(bookmark, label, meta, getBookmarkTags(bookmark));
                 return (
                   <BookmarkCard

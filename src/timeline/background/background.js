@@ -1030,13 +1030,22 @@ async function resolveRecommendationReview(payload = {}) {
         await discardRecommendationReviewItem(review.id);
         return { success: true, decision: 'ignore' };
       }
+      const [nativeBookmark] = await chrome.bookmarks.get(review.bookmarkId).catch(() => []);
+      if (!nativeBookmark?.url
+        || recommendationUrlFingerprint(nativeBookmark.url) !== snapshot.urlFingerprint
+        || nativeBookmark.parentId !== review.toFolderId) {
+        return { success: false, error: 'bookmark_changed' };
+      }
+      const folderOptions = await loadBookmarkFolderOptions().catch(() => []);
+      const targetFolder = folderOptions.find(item => item.id === nativeBookmark.parentId);
+      if (!targetFolder?.path) return { success: false, error: 'bookmark_changed' };
       const feedback = await submitRecommendationFeedback({
         operationId: `${operationId}:feedback`,
         recommendationId: review.recommendationId,
         bookmarkId: review.bookmarkId,
         outcome: 'accepted',
         changedFields: [],
-        selection: { folderPath: review.toFolderPath, tags: [] },
+        selection: { folderPath: targetFolder.path, tags: [] },
       });
       return feedback.success ? { success: true, decision } : feedback;
     }
@@ -1079,7 +1088,13 @@ async function resolveRecommendationReview(payload = {}) {
       }
     }
     const recommendedTags = normalizeTagList(tagCandidate?.tag ? [tagCandidate.tag] : []);
-    const finalTags = normalizeTagList([...(storedBookmark.tags || []), ...recommendedTags]);
+    const existingTags = normalizeTagList(storedBookmark.tags || []);
+    const existingTagKeys = new Set(existingTags.map(tag => tag.toLowerCase()));
+    const addedRecommendedTags = recommendedTags.filter(tag => !existingTagKeys.has(tag.toLowerCase()));
+    const finalTags = normalizeTagList([...existingTags, ...recommendedTags]);
+    const finalTagKeys = new Set(finalTags.map(tag => tag.toLowerCase()));
+    const finalAutoTags = normalizeTagList([...(storedBookmark.tagsAuto || []), ...addedRecommendedTags])
+      .filter(tag => finalTagKeys.has(tag.toLowerCase()));
     if (!targetFolder && recommendedTags.length === 0) return { success: false, error: 'no_applicable_candidate' };
 
     let moved = false;
@@ -1095,7 +1110,7 @@ async function resolveRecommendationReview(payload = {}) {
         folderName: targetFolder?.title || item.folderName,
         folderPath: targetFolder?.path || item.folderPath,
         tags: finalTags,
-        tagsAuto: finalTags,
+        tagsAuto: finalAutoTags,
       }));
 
       const finalFolderPath = targetFolder?.path || normalizeBookmarkFolderPath(storedBookmark.folderPath || '');
@@ -6820,7 +6835,7 @@ async function getCheckSettings() {
     checkerTimeout: checkerNumber(result.checkerTimeout, defaults.checkerTimeout, 1, 120000),
     checkerFrequency: frequency,
     checkerConcurrency: checkerNumber(result.checkerConcurrency, defaults.checkerConcurrency, 1, 5),
-    checkerTime: typeof result.checkerTime === 'string' && /^\d{2}:\d{2}$/.test(result.checkerTime)
+    checkerTime: typeof result.checkerTime === 'string' && /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(result.checkerTime)
       ? result.checkerTime
       : defaults.checkerTime,
     checkerDayOfWeek: checkerNumber(result.checkerDayOfWeek, defaults.checkerDayOfWeek, 0, 6),
@@ -6877,9 +6892,11 @@ async function scheduleCheckerAlarm() {
     }
   } else if (frequency === 'monthly') {
     const dayOfMonth = Math.max(1, Number(settings.checkerDayOfMonth ?? 1));
+    target.setDate(1);
     const daysInMonth = new Date(target.getFullYear(), target.getMonth() + 1, 0).getDate();
     target.setDate(Math.min(dayOfMonth, daysInMonth));
     if (target <= now) {
+      target.setDate(1);
       target.setMonth(target.getMonth() + 1);
       const nextDaysInMonth = new Date(target.getFullYear(), target.getMonth() + 1, 0).getDate();
       target.setDate(Math.min(dayOfMonth, nextDaysInMonth));
@@ -6890,16 +6907,15 @@ async function scheduleCheckerAlarm() {
   switch (frequency) {
     case 'daily': periodInMinutes = 24 * 60; break;
     case 'weekly': periodInMinutes = 7 * 24 * 60; break;
-    case 'monthly': periodInMinutes = 30 * 24 * 60; break;
+    case 'monthly': break;
     default: return;
   }
 
-  const delayInMinutes = Math.max(1, Math.round((target - now) / 60000));
+  const delayInMinutes = Math.max(1, Math.ceil((target - now) / 60000));
+  const alarmOptions = { delayInMinutes };
+  if (periodInMinutes) alarmOptions.periodInMinutes = periodInMinutes;
 
-  await chrome.alarms.create(CHECKER_ALARM_PREFIX + frequency, {
-    delayInMinutes: delayInMinutes,
-    periodInMinutes: periodInMinutes
-  });
+  await chrome.alarms.create(CHECKER_ALARM_PREFIX + frequency, alarmOptions);
 }
 
 // 闹钟触发时执行后台检测
@@ -6920,6 +6936,10 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
   }
 
   if (!alarm.name.startsWith(CHECKER_ALARM_PREFIX)) return;
+
+  if (alarm.name === CHECKER_ALARM_PREFIX + 'monthly') {
+    await scheduleCheckerAlarm().catch(err => console.warn('Monthly bookmark check reschedule failed:', err));
+  }
 
   // 定时检测整体兜底：Chrome 不消费 listener 返回的 promise，任一 await 抛错
   // （典型是结果写入超出 storage 配额）都会变成静默的 unhandled rejection，

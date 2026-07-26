@@ -5,7 +5,7 @@ import vm from 'node:vm';
 const feedStoreSource = readFileSync('src/timeline/shared/feed-store.js', 'utf8');
 const feedFetcherSource = readFileSync('src/timeline/background/feed-fetcher.js', 'utf8');
 
-function createStorage(initial = {}) {
+function createStorage(initial = {}, hooks = {}) {
   const values = new Map(Object.entries(structuredClone(initial)));
   return {
     values,
@@ -18,13 +18,15 @@ function createStorage(initial = {}) {
       for (const [key, value] of Object.entries(patch)) values.set(key, structuredClone(value));
     },
     async remove(keys) {
-      for (const key of Array.isArray(keys) ? keys : [keys]) values.delete(key);
+      const requested = Array.isArray(keys) ? keys : [keys];
+      await hooks.beforeRemove?.(requested);
+      for (const key of requested) values.delete(key);
     },
   };
 }
 
-function createHarness(initial) {
-  const storage = createStorage(initial);
+function createHarness(initial, options = {}) {
+  const storage = createStorage(initial, options.storageHooks);
   let active = 0;
   let maxActive = 0;
   const requestedUrls = [];
@@ -32,7 +34,8 @@ function createHarness(initial) {
     requestedUrls.push(String(url));
     active += 1;
     maxActive = Math.max(maxActive, active);
-    await new Promise((resolve) => setTimeout(resolve, 8));
+    if (options.fetchGate) await options.fetchGate(String(url));
+    else await new Promise((resolve) => setTimeout(resolve, 8));
     active -= 1;
     if (String(url).includes('/failed')) throw new Error('connection refused');
     return {
@@ -91,6 +94,12 @@ function makeFeed(id, patch = {}) {
   };
 }
 
+function deferred() {
+  let resolve;
+  const promise = new Promise((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
 const firstFeeds = [makeFeed('one'), makeFeed('two'), makeFeed('failed'), makeFeed('four'), makeFeed('five')];
 const first = createHarness({ rss_feeds: firstFeeds });
 const firstResult = await first.context.FeedFetcher.pollAll();
@@ -130,6 +139,55 @@ assert.deepEqual(JSON.parse(JSON.stringify(resumed.summary)), {
   skipped: 1,
   added: 5,
 });
+
+const deleteHarness = createHarness({
+  rss_feeds: [makeFeed('delete')],
+  rss_items_delete: [{ id: 'old-item', guid: 'old-guid' }],
+});
+await deleteHarness.context.FeedStore.removeFeed('delete');
+assert.equal(deleteHarness.storage.values.has('rss_feeds'), true);
+assert.deepEqual(deleteHarness.storage.values.get('rss_feeds'), []);
+assert.equal(deleteHarness.storage.values.has('rss_items_delete'), false, 'removing a feed must delete its item shard');
+
+const removeStarted = deferred();
+const releaseRemove = deferred();
+const queueHarness = createHarness({
+  rss_feeds: [makeFeed('queue')],
+  rss_items_queue: [{ id: 'old-item', guid: 'old-guid' }],
+}, {
+  storageHooks: {
+    beforeRemove: async (keys) => {
+      if (!keys.includes('rss_items_queue')) return;
+      removeStarted.resolve();
+      await releaseRemove.promise;
+    },
+  },
+});
+const queuedRemoval = queueHarness.context.FeedStore.removeFeed('queue');
+await removeStarted.promise;
+const queuedWrite = queueHarness.context.FeedStore.mutateStorage('rss_items_queue', () => [{ id: 'new-item', guid: 'new-guid' }]);
+await new Promise((resolve) => setTimeout(resolve, 20));
+releaseRemove.resolve();
+await Promise.all([queuedRemoval, queuedWrite]);
+assert.deepEqual(
+  queueHarness.storage.values.get('rss_items_queue'),
+  [{ id: 'new-item', guid: 'new-guid' }],
+  'a queued mutation after deletion must not be overwritten by an out-of-queue remove',
+);
+
+const releaseFetch = deferred();
+const raceHarness = createHarness({
+  rss_feeds: [makeFeed('race')],
+  rss_items_race: [{ id: 'old-item', guid: 'old-guid' }],
+}, { fetchGate: async () => releaseFetch.promise });
+const refreshDuringDelete = raceHarness.context.FeedFetcher.refreshFeed('race');
+while (raceHarness.requestedUrls.length === 0) await new Promise((resolve) => setTimeout(resolve, 0));
+await raceHarness.context.FeedStore.removeFeed('race');
+releaseFetch.resolve();
+const deletedRefresh = await refreshDuringDelete;
+assert.deepEqual(Array.from(deletedRefresh.added || []), [], 'an in-flight fetch must not add items after its feed is removed');
+assert.equal(await raceHarness.context.FeedStore.getFeed('race'), null);
+assert.equal(raceHarness.storage.values.has('rss_items_race'), false, 'an in-flight fetch must not recreate an orphaned item shard');
 
 const settingsSource = readFileSync('src/timeline/pages/settings/settings.js', 'utf8');
 const i18nSource = readFileSync('src/timeline/shared/i18n.js', 'utf8');

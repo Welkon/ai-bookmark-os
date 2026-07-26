@@ -193,6 +193,55 @@ assert.equal(state.recentFeedback.length, 2);
 assert.equal(state.rules.find(rule => rule.kind === 'domain_folder' && rule.pattern === 'example.test').state, 'active');
 assert.equal(state.rules.find(rule => rule.kind === 'domain_tag' && rule.pattern === 'example.test').state, 'active');
 
+nativeBookmarks.set('provenance', { id: 'provenance', title: 'provenance', url: 'https://provenance.test/provenance', parentId: 'folder-source' });
+mirroredBookmarks.push({
+  id: 'provenance',
+  title: 'provenance',
+  url: 'https://provenance.test/provenance',
+  domain: 'provenance.test',
+  parentId: 'folder-source',
+  folderPath: 'Inbox',
+  tags: ['Manual', 'Existing Auto'],
+  tagsAuto: ['Existing Auto', 'Orphan Auto'],
+});
+const provenanceStore = storage.get(context.RECOMMENDATION_STORE_KEY);
+provenanceStore.snapshots.push(makeSnapshot('rec-provenance', 'provenance', 'provenance.test'));
+storage.set(context.RECOMMENDATION_STORE_KEY, provenanceStore);
+await helpers.enqueueRecommendationReviewItem({
+  ...makeReview('review-provenance', 'provenance', 'rec-provenance'),
+  sourceParentId: 'folder-source',
+  sourceTags: ['Manual', 'Existing Auto'],
+});
+const provenance = await helpers.resolveRecommendationReview({ operationId: 'apply-provenance', reviewId: 'review-provenance', decision: 'accept' });
+assert.equal(provenance.success, true);
+assert.deepEqual(mirroredBookmarks.find(item => item.id === 'provenance').tags, ['Manual', 'Existing Auto', 'Development']);
+assert.deepEqual(
+  mirroredBookmarks.find(item => item.id === 'provenance').tagsAuto,
+  ['Existing Auto', 'Development'],
+  'accepted recommendations must not reclassify manual or orphaned tags as automatic',
+);
+
+nativeBookmarks.set('manual-match', { id: 'manual-match', title: 'manual match', url: 'https://manual-match.test/manual-match', parentId: 'folder-source' });
+mirroredBookmarks.push({ id: 'manual-match', title: 'manual match', url: 'https://manual-match.test/manual-match', domain: 'manual-match.test', parentId: 'folder-source', folderPath: 'Inbox', tags: ['Development'], tagsAuto: [] });
+const manualMatchStore = storage.get(context.RECOMMENDATION_STORE_KEY);
+manualMatchStore.snapshots.push({
+  ...makeSnapshot('rec-manual-match', 'manual-match', 'manual-match.test'),
+  selectedTags: ['Development'],
+});
+storage.set(context.RECOMMENDATION_STORE_KEY, manualMatchStore);
+await helpers.enqueueRecommendationReviewItem({
+  ...makeReview('review-manual-match', 'manual-match', 'rec-manual-match'),
+  sourceParentId: 'folder-source',
+  sourceTags: ['Development'],
+});
+const manualMatch = await helpers.resolveRecommendationReview({ operationId: 'apply-manual-match', reviewId: 'review-manual-match', decision: 'accept' });
+assert.equal(manualMatch.success, true);
+assert.deepEqual(
+  mirroredBookmarks.find(item => item.id === 'manual-match').tagsAuto,
+  [],
+  'a recommendation that already exists as a manual tag must remain manual',
+);
+
 nativeBookmarks.set('m1', { id: 'm1', title: 'm1', url: 'https://move.test/m1', parentId: 'folder-target' });
 mirroredBookmarks.push({ id: 'm1', title: 'm1', url: 'https://move.test/m1', domain: 'move.test', parentId: 'folder-target', folderPath: 'Work/Development', tags: [] });
 const moveStore = storage.get(context.RECOMMENDATION_STORE_KEY);
@@ -207,6 +256,49 @@ const confirmedMove = await helpers.resolveRecommendationReview({ operationId: '
 assert.equal(confirmedMove.success, true);
 state = await helpers.getRecommendationLearningState();
 assert.equal(state.rules.find(rule => rule.kind === 'domain_folder' && rule.pattern === 'move.test').state, 'candidate');
+
+nativeBookmarks.set('renamed-move', { id: 'renamed-move', title: 'renamed move', url: 'https://renamed-move.test/renamed-move', parentId: 'folder-target' });
+mirroredBookmarks.push({ id: 'renamed-move', title: 'renamed move', url: 'https://renamed-move.test/renamed-move', domain: 'renamed-move.test', parentId: 'folder-target', folderPath: 'Work/Development', tags: [] });
+const renamedMoveStore = storage.get(context.RECOMMENDATION_STORE_KEY);
+renamedMoveStore.snapshots.push({
+  ...makeSnapshot('rec-renamed-move', 'renamed-move', 'renamed-move.test'),
+  tags: [],
+  selectedTags: [],
+});
+storage.set(context.RECOMMENDATION_STORE_KEY, renamedMoveStore);
+await helpers.enqueueRecommendationReviewItem(makeReview('review-renamed-move', 'renamed-move', 'rec-renamed-move', 'move_observation'));
+const targetFolder = folderOptions.find(item => item.id === 'folder-target');
+const originalTargetPath = targetFolder.path;
+targetFolder.path = 'Work/Renamed Development';
+const renamedMove = await helpers.resolveRecommendationReview({ operationId: 'confirm-renamed-move', reviewId: 'review-renamed-move', decision: 'accept' });
+targetFolder.path = originalTargetPath;
+assert.equal(renamedMove.success, true);
+state = await helpers.getRecommendationLearningState();
+assert.equal(
+  state.recentFeedback.find(item => item.operationId === 'confirm-renamed-move:feedback').selection.folderPath,
+  'Work/Renamed Development',
+  'move observations must learn the target folder current path after a rename',
+);
+
+nativeBookmarks.set('stale-move', { id: 'stale-move', title: 'stale move', url: 'https://stale-move.test/stale-move', parentId: 'folder-target' });
+mirroredBookmarks.push({ id: 'stale-move', title: 'stale move', url: 'https://stale-move.test/stale-move', domain: 'stale-move.test', parentId: 'folder-target', folderPath: 'Work/Development', tags: [] });
+const staleMoveStore = storage.get(context.RECOMMENDATION_STORE_KEY);
+staleMoveStore.snapshots.push({
+  ...makeSnapshot('rec-stale-move', 'stale-move', 'stale-move.test'),
+  tags: [],
+  selectedTags: [],
+});
+storage.set(context.RECOMMENDATION_STORE_KEY, staleMoveStore);
+await helpers.enqueueRecommendationReviewItem(makeReview('review-stale-move', 'stale-move', 'rec-stale-move', 'move_observation'));
+nativeBookmarks.set('stale-move', { ...nativeBookmarks.get('stale-move'), parentId: 'folder-source' });
+const stateBeforeStaleMove = await helpers.getRecommendationLearningState();
+const staleMove = await helpers.resolveRecommendationReview({ operationId: 'confirm-stale-move', reviewId: 'review-stale-move', decision: 'accept' });
+assert.deepEqual({ ...staleMove }, { success: false, error: 'bookmark_changed' });
+state = await helpers.getRecommendationLearningState();
+assert.equal(state.recentFeedback.length, stateBeforeStaleMove.recentFeedback.length, 'stale move observations must not create learning feedback');
+assert.deepEqual({ ...state.stats }, { ...stateBeforeStaleMove.stats }, 'stale move observations must not change learning stats');
+assert.equal(state.rules.length, stateBeforeStaleMove.rules.length, 'stale move observations must not change learned rules');
+assert.ok(state.reviewQueue.some(item => item.id === 'review-stale-move'), 'stale move observations must remain available for explicit removal');
 
 nativeBookmarks.set('stale-url', { id: 'stale-url', title: 'stale', url: 'https://changed.test/page', parentId: 'folder-source' });
 mirroredBookmarks.push({ id: 'stale-url', title: 'stale', url: 'https://changed.test/page', parentId: 'folder-source', folderPath: 'Inbox', tags: [] });

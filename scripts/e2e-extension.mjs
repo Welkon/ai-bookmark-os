@@ -55,6 +55,28 @@ async function assertNoHorizontalOverflow(page, label) {
   assert.ok(dimensions.scrollWidth <= dimensions.clientWidth + 1, `${label} has horizontal overflow: ${JSON.stringify(dimensions)}`);
 }
 
+async function readBookmarkCardVisualContract(page, selectors) {
+  return page.evaluate((targetSelectors) => {
+    const getElement = (name) => {
+      const element = document.querySelector(targetSelectors[name]);
+      if (!element) throw new Error(`visual contract target not found: ${targetSelectors[name]}`);
+      return element;
+    };
+    const read = (name, properties) => {
+      const style = getComputedStyle(getElement(name));
+      return Object.fromEntries(properties.map((property) => [property, style[property]]));
+    };
+    return {
+      grid: read('grid', ['columnGap', 'rowGap']),
+      card: read('card', ['backgroundColor', 'borderColor', 'borderRadius', 'boxShadow', 'padding', 'gap', 'backdropFilter']),
+      favicon: read('favicon', ['width', 'height', 'borderRadius']),
+      title: read('title', ['fontSize', 'fontWeight']),
+      domain: read('domain', ['fontSize']),
+      tag: read('tag', ['padding', 'borderRadius', 'fontSize', 'fontWeight']),
+    };
+  }, selectors);
+}
+
 async function openExtensionPage(context, extensionId, path, errors) {
   const page = await context.newPage();
   page.on('pageerror', (error) => errors.push(`${path}: ${error.message}`));
@@ -90,7 +112,13 @@ const mockServer = createServer((request, response) => {
   if (request.url === '/health-check') {
     requests.checker += 1;
     response.setHeader('Content-Type', 'text/html; charset=utf-8');
-    response.end(request.method === 'HEAD' ? '' : '<title>Available bookmark</title><main>Healthy fixture</main>');
+    response.end(request.method === 'HEAD' ? '' : '<title>Available bookmark</title><meta name="description" content="Original metadata summary"><main>Healthy fixture</main>');
+    return;
+  }
+  if (request.url === '/health-check-updated') {
+    requests.checker += 1;
+    response.setHeader('Content-Type', 'text/html; charset=utf-8');
+    response.end(request.method === 'HEAD' ? '' : '<title>Updated bookmark</title><meta name="description" content="Updated metadata summary"><main>Updated healthy fixture</main>');
     return;
   }
   response.writeHead(404);
@@ -432,6 +460,7 @@ try {
     ['health checker', 'pages/checker/checker.html', /检查|Check|书签|Bookmark/i],
     ['graph', 'pages/graph/graph.html', /图谱|Graph/i],
   ];
+  let workspaceCardVisualContract;
   for (const [label, path, textPattern] of pages) {
     if (label === 'bookmark navigation') {
       await worker.evaluate(async () => {
@@ -477,6 +506,20 @@ try {
     }
     await page.locator('body').filter({ hasText: textPattern }).waitFor({ timeout: 10000 });
     await assertNoHorizontalOverflow(page, label);
+    if (label === 'workspace') {
+      await page.locator('.sa-view-btn[data-view="grid"]').click();
+      await page.locator('.sa-grid-card').first().waitFor({ timeout: 10000 });
+      await page.locator('.sa-grid-card .sa-bookmark-tag').first().waitFor({ timeout: 10000 });
+      workspaceCardVisualContract = await readBookmarkCardVisualContract(page, {
+        grid: '.sa-view--grid',
+        card: '.sa-grid-card',
+        favicon: '.sa-grid-card-favicon',
+        title: '.sa-grid-card-title',
+        domain: '.sa-grid-card-domain',
+        tag: '.sa-grid-card .sa-bookmark-tag',
+      });
+      await page.screenshot({ path: join(artifactsPath, 'workspace-grid-desktop.png'), fullPage: true });
+    }
     if (label === 'graph') {
       await page.locator('#graphLoading').waitFor({ state: 'hidden', timeout: 10000 });
       const graphCanvas = page.locator('#cy canvas').first();
@@ -516,6 +559,15 @@ try {
       const unifiedTag = page.locator('.bookmark-card__tag', { hasText: 'E2E Unified Tag' });
       await unifiedTag.waitFor({ timeout: 10000 });
       assert.equal(await unifiedTag.evaluate((element) => getComputedStyle(element).color), 'rgb(18, 52, 86)');
+      await page.getByText('Original metadata summary', { exact: true }).waitFor({ timeout: 10000 });
+      await worker.evaluate(async ({ port: fixturePort }) => {
+        const matches = await chrome.bookmarks.search({ title: 'Synthetic Healthy Link' });
+        const bookmark = matches.find((item) => item.url);
+        if (!bookmark) throw new Error('metadata refresh fixture was not found');
+        await chrome.bookmarks.update(bookmark.id, { url: `http://127.0.0.1:${fixturePort}/health-check-updated` });
+      }, { port });
+      await page.getByText('Updated metadata summary', { exact: true }).waitFor({ timeout: 10000 });
+      assert.equal(await page.getByText('Original metadata summary', { exact: true }).count(), 0, 'bookmark navigation kept metadata from the previous URL');
       await worker.evaluate(async () => {
         const state = await chrome.storage.local.get('bookmark_timeline_data');
         const bookmarks = state.bookmark_timeline_data || [];
@@ -532,6 +584,24 @@ try {
       await syncedTag.waitFor({ timeout: 10000 });
       assert.equal(await syncedTag.evaluate((element) => getComputedStyle(element).color), 'rgb(101, 67, 33)');
       assert.equal(await page.getByText('E2E Unified Tag', { exact: true }).count(), 0, 'bookmark navigation did not refresh its shared tags');
+      const navigationCardVisualContract = await readBookmarkCardVisualContract(page, {
+        grid: '.bookmark-grid',
+        card: '.bookmark-card',
+        favicon: '.bookmark-card__favicon',
+        title: '.bookmark-card__title',
+        domain: '.bookmark-card__domain',
+        tag: '.bookmark-card__tag',
+      });
+      assert.deepEqual(
+        navigationCardVisualContract,
+        workspaceCardVisualContract,
+        `bookmark navigation card styles diverged from workspace: ${JSON.stringify({ workspaceCardVisualContract, navigationCardVisualContract })}`,
+      );
+      await page.screenshot({ path: join(artifactsPath, 'bookmark-navigation-desktop.png'), fullPage: true });
+      await page.setViewportSize({ width: 390, height: 844 });
+      await page.waitForTimeout(250);
+      await page.screenshot({ path: join(artifactsPath, 'bookmark-navigation-narrow.png'), fullPage: true });
+      await assertNoHorizontalOverflow(page, 'bookmark navigation narrow');
     }
     if (label === 'AI classification') {
       await page.setViewportSize({ width: 1440, height: 900 });
