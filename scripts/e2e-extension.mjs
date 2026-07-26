@@ -109,6 +109,11 @@ const mockServer = createServer((request, response) => {
     }));
     return;
   }
+  if (request.url === '/click-count') {
+    response.setHeader('Content-Type', 'text/html; charset=utf-8');
+    response.end('<!doctype html><html><head><title>Click count fixture</title></head><body><main>Click count fixture</main></body></html>');
+    return;
+  }
   if (request.url === '/health-check') {
     requests.checker += 1;
     response.setHeader('Content-Type', 'text/html; charset=utf-8');
@@ -154,6 +159,7 @@ try {
     await chrome.bookmarks.create({ parentId: folder.id, title: 'Synthetic React', url: 'https://example.test/react' });
     await chrome.bookmarks.create({ parentId: folder.id, title: 'Synthetic Design', url: 'https://example.test/design' });
     await chrome.bookmarks.create({ parentId: folder.id, title: 'Synthetic Operations', url: 'https://example.test/ops' });
+    await chrome.bookmarks.create({ parentId: folder.id, title: 'Synthetic Count', url: `http://127.0.0.1:${fixturePort}/click-count` });
     await chrome.bookmarks.create({ parentId: folder.id, title: 'Synthetic Healthy Link', url: `http://127.0.0.1:${fixturePort}/health-check` });
     const reviewTargetFolder = await chrome.bookmarks.create({ parentId: bar.id, title: 'E2E Batch Target' });
     const reviewBookmarkOne = await chrome.bookmarks.create({ parentId: folder.id, title: 'Synthetic Batch One', url: 'https://batch.example/one' });
@@ -320,6 +326,106 @@ try {
   }, { port });
 
   const pageErrors = [];
+  const clickCountUrl = `http://127.0.0.1:${port}/click-count`;
+  const readClickCountState = () => worker.evaluate(async (targetUrl) => {
+    const normalize = value => String(value || '').replace(/\/+$/, '');
+    const historyItems = await chrome.history.search({ text: targetUrl, startTime: 0, maxResults: 100 });
+    const historyItem = historyItems.find(item => normalize(item.url) === normalize(targetUrl));
+    const visits = historyItem?.url ? await chrome.history.getVisits({ url: historyItem.url }) : [];
+    const stored = await chrome.storage.local.get('bookmark_timeline_data');
+    const bookmark = (stored.bookmark_timeline_data || []).find(item => item.title === 'Synthetic Count');
+    return {
+      historyUrl: historyItem?.url || '',
+      visitCount: Number(historyItem?.visitCount) || 0,
+      visitRows: visits.length,
+      storedCount: Number(bookmark?.clickCount) || 0,
+      storedLastClickedAt: Number(bookmark?.lastClickedAt) || 0,
+    };
+  }, clickCountUrl);
+  const waitForClickCountState = async (predicate, label, timeoutMs = 10000) => {
+    const deadline = Date.now() + timeoutMs;
+    let state;
+    while (Date.now() < deadline) {
+      state = await readClickCountState();
+      if (predicate(state)) return state;
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    throw new Error(`${label}: ${JSON.stringify(state)}`);
+  };
+
+  const countFixturePage = await context.newPage();
+  countFixturePage.on('pageerror', (error) => pageErrors.push(`click-count fixture: ${error.message}`));
+  await countFixturePage.goto(clickCountUrl, { waitUntil: 'domcontentloaded' });
+  await countFixturePage.reload({ waitUntil: 'domcontentloaded' });
+  await countFixturePage.reload({ waitUntil: 'domcontentloaded' });
+  const initialClickState = await waitForClickCountState(
+    state => state.visitCount > 0 && state.storedCount === state.visitCount && state.visitRows > state.visitCount,
+    'reload visits did not produce stable HistoryItem.visitCount semantics',
+  );
+  await countFixturePage.close();
+
+  await worker.evaluate(async () => {
+    const stored = await chrome.storage.local.get('bookmark_timeline_data');
+    const bookmarks = stored.bookmark_timeline_data || [];
+    const index = bookmarks.findIndex(item => item.title === 'Synthetic Count');
+    if (index < 0) throw new Error('click count fixture bookmark was not mirrored');
+    bookmarks[index] = { ...bookmarks[index], clickCount: 443, lastClickedAt: Date.now() + 1000 };
+    await chrome.storage.local.set({ bookmark_timeline_data: bookmarks });
+    await chrome.storage.local.remove('click_count_source_version');
+  });
+
+  const countPopup = await openExtensionPage(context, extensionId, 'pages/popup/popup.html', pageErrors);
+  const countCard = countPopup.locator('.bookmark-item', { hasText: 'Synthetic Count' });
+  await countCard.waitFor({ state: 'visible', timeout: 15000 });
+  assert.equal(
+    Number(await countCard.locator('.bookmark-heat-info').innerText()),
+    initialClickState.visitCount,
+    'popup first display did not migrate the legacy inflated count',
+  );
+  await countCard.scrollIntoViewIfNeeded();
+  await countPopup.waitForFunction(() => Array.from(document.querySelectorAll('.bookmark-item')).some(item => (
+    item.textContent.includes('Synthetic Count') && Number(getComputedStyle(item).opacity) >= 0.99
+  )));
+  await countPopup.screenshot({ path: join(artifactsPath, 'click-count-popup.png'), fullPage: true });
+
+  const openedCountPagePromise = context.waitForEvent('page');
+  await countCard.click();
+  const openedCountPage = await openedCountPagePromise;
+  await openedCountPage.waitForLoadState('domcontentloaded');
+  const clickedState = await waitForClickCountState(
+    state => state.visitCount === initialClickState.visitCount + 1 && state.storedCount === state.visitCount,
+    'popup navigation did not persist the absolute visitCount',
+  );
+  await openedCountPage.reload({ waitUntil: 'domcontentloaded' });
+  await openedCountPage.reload({ waitUntil: 'domcontentloaded' });
+  const reloadedState = await waitForClickCountState(
+    state => state.storedCount === state.visitCount && state.visitRows > state.visitCount,
+    'reload changed the stored count away from HistoryItem.visitCount',
+  );
+  await worker.evaluate(() => refreshStoredClickCounts());
+  const refreshedState = await readClickCountState();
+  assert.equal(refreshedState.storedCount, reloadedState.visitCount, 'manual reconciliation changed the count source');
+  assert.equal(refreshedState.visitCount, clickedState.visitCount, 'reload unexpectedly changed visitCount');
+  await openedCountPage.close();
+  await countPopup.close();
+
+  const refreshedPopup = await openExtensionPage(context, extensionId, 'pages/popup/popup.html', pageErrors);
+  const refreshedCountCard = refreshedPopup.locator('.bookmark-item', { hasText: 'Synthetic Count' });
+  await refreshedCountCard.waitFor({ state: 'visible', timeout: 10000 });
+  assert.equal(Number(await refreshedCountCard.locator('.bookmark-heat-info').innerText()), reloadedState.visitCount);
+  await refreshedPopup.close();
+
+  await worker.evaluate(async (targetUrl) => {
+    const normalize = value => String(value || '').replace(/\/+$/, '');
+    const historyItems = await chrome.history.search({ text: targetUrl, startTime: 0, maxResults: 100 });
+    const historyItem = historyItems.find(item => normalize(item.url) === normalize(targetUrl));
+    if (historyItem?.url) await chrome.history.deleteUrl({ url: historyItem.url });
+  }, clickCountUrl);
+  await waitForClickCountState(
+    state => state.visitCount === 0 && state.visitRows === 0 && state.storedCount === 0 && state.storedLastClickedAt === 0,
+    'history removal did not clear the stored click count',
+  );
+
   const settings = await openExtensionPage(context, extensionId, 'pages/settings/settings.html', pageErrors);
   await settings.locator('[data-panel="ai"]').click();
   await settings.locator('#panel-ai').waitFor({ state: 'visible' });

@@ -398,6 +398,12 @@ function mutateStorageResource(key, mutation) {
   });
 }
 
+async function waitForStorageResourceMutations(key) {
+  while (storageMutationQueues.has(key)) {
+    await storageMutationQueues.get(key).catch(() => undefined);
+  }
+}
+
 async function mutateStoredBookmarks(mutation) {
   return mutateStorageResource(STORAGE_KEY, (current) => mutation(Array.isArray(current) ? current : []));
 }
@@ -2201,7 +2207,9 @@ async function rollbackImportOperation(operationId) {
 }
 // ===== 同步操作 =====
 async function syncAllBookmarksOnce() {
+  const clickCountRefreshGuard = beginClickCountRefreshGuard();
   try {
+    await waitForStorageResourceMutations(STORAGE_KEY);
     const tree = await chrome.bookmarks.getTree();
     const allBookmarks = await collectAllBookmarks(tree);
     const existing = await getStoredBookmarks();
@@ -2297,7 +2305,7 @@ async function syncAllBookmarksOnce() {
 
     // 从 Chrome 历史记录获取真实访问次数，并应用到本次同步快照。
     const clickCountUpdates = await enrichClickCounts(merged, 10);
-    applyClickCountUpdates(merged, clickCountUpdates);
+    applyClickCountUpdates(merged, clickCountUpdates, clickCountRefreshGuard);
 
     // 排序：置顶在前，再按时间倒序
     merged.sort((a, b) => {
@@ -2310,7 +2318,12 @@ async function syncAllBookmarksOnce() {
       const latestByKey = new Map(latest.map((item) => [item.url + '_' + item.dateAdded, item]));
       return merged.map((item) => {
         const current = latestById.get(item.id) || latestByKey.get(item.url + '_' + item.dateAdded);
-        if (!current) return item;
+        const latestVisit = getLatestClickCountDuringRefresh(item.url, clickCountRefreshGuard);
+        const keepCurrentClickCount = clickCountChangedDuringRefresh(item.url, clickCountRefreshGuard);
+        if (!current) {
+          if (latestVisit) return { ...item, ...latestVisit };
+          return keepCurrentClickCount ? { ...item, clickCount: 0, lastClickedAt: null } : item;
+        }
         const refreshedAutoTags = refreshedTagKeys.has(itemKey(item));
         const refreshed = refreshedAutoTags
           ? applyLocalAutoTags(current.tags, current.tagsAuto, item.tagsAuto)
@@ -2326,8 +2339,8 @@ async function syncAllBookmarksOnce() {
           ...item,
           pinned: !!current.pinned,
           pinnedAt: current.pinnedAt || null,
-          clickCount: item.clickCount || 0,
-          lastClickedAt: item.lastClickedAt || null,
+          clickCount: latestVisit?.clickCount ?? (keepCurrentClickCount ? (current.clickCount || 0) : (item.clickCount || 0)),
+          lastClickedAt: latestVisit ? latestVisit.lastClickedAt : (keepCurrentClickCount ? (current.lastClickedAt || null) : (item.lastClickedAt || null)),
           tags,
           tagsAuto,
           contentText: current.contentText || item.contentText,
@@ -2344,10 +2357,14 @@ async function syncAllBookmarksOnce() {
         };
       });
     });
+    await waitForStorageResourceMutations(STORAGE_KEY);
+    await chrome.storage.local.set({ [CLICK_COUNT_SOURCE_VERSION_KEY]: CLICK_COUNT_SOURCE_VERSION });
     return { total: merged.length, added, tagged: taggedCount };
   } catch (err) {
     console.error('全量同步失败:', err);
     throw err;
+  } finally {
+    endClickCountRefreshGuard(clickCountRefreshGuard);
   }
 }
 
@@ -5021,58 +5038,192 @@ async function updateBookmark(id, changes) {
   }
 }
 
-// ===== 从 Chrome 历史记录获取真实点击次数 =====
-async function enrichClickCounts(bookmarks, concurrency = 5) {
-  const updated = [];
-  await runWithConcurrency(bookmarks, concurrency, async (item) => {
-    if (!item.url) return;
-    try {
-      const visits = await chrome.history.getVisits({ url: item.url });
-      const count = visits ? visits.length : 0;
-      const lastClickedAt = count > 0
-        ? Math.max(...visits.map((visit) => Number(visit.visitTime) || 0))
-        : null;
-      if (count !== (item.clickCount || 0) || lastClickedAt !== (item.lastClickedAt || null)) {
-        updated.push({ id: item.id, url: item.url, clickCount: count, lastClickedAt });
-      }
-    } catch (e) {
-      // 某些 URL（如 chrome://）不支持 history API，静默忽略
-    }
-  });
-  return updated;
+const CLICK_COUNT_SOURCE_VERSION_KEY = 'click_count_source_version';
+const CLICK_COUNT_SOURCE_VERSION = 1;
+const CLICK_COUNT_HISTORY_SEARCH_LIMIT = 1000;
+const activeClickCountRefreshGuards = new Set();
+
+function normalizeClickCountUrl(url) {
+  return String(url || '').replace(/\/+$/, '');
 }
 
-function applyClickCountUpdates(bookmarks, updates) {
+function beginClickCountRefreshGuard() {
+  const guard = { allHistoryChanged: false, urls: new Set(), latestVisits: new Map() };
+  activeClickCountRefreshGuards.add(guard);
+  return guard;
+}
+
+function endClickCountRefreshGuard(guard) {
+  activeClickCountRefreshGuards.delete(guard);
+}
+
+function noteClickCountHistoryChange(urls, allHistory = false) {
+  for (const guard of activeClickCountRefreshGuards) {
+    if (allHistory) {
+      guard.allHistoryChanged = true;
+      guard.latestVisits.clear();
+      continue;
+    }
+    for (const url of urls || []) {
+      const normalizedUrl = normalizeClickCountUrl(url);
+      if (normalizedUrl) {
+        guard.urls.add(normalizedUrl);
+        guard.latestVisits.delete(normalizedUrl);
+      }
+    }
+  }
+}
+
+function noteClickCountHistoryVisit(url, clickCount, lastClickedAt) {
+  const normalizedUrl = normalizeClickCountUrl(url);
+  if (!normalizedUrl) return;
+  for (const guard of activeClickCountRefreshGuards) {
+    guard.urls.add(normalizedUrl);
+    guard.latestVisits.set(normalizedUrl, { clickCount, lastClickedAt });
+  }
+}
+
+function getLatestClickCountDuringRefresh(url, guard) {
+  return guard?.latestVisits.get(normalizeClickCountUrl(url)) || null;
+}
+
+function clickCountChangedDuringRefresh(url, guard) {
+  return !!guard && (
+    guard.allHistoryChanged
+    || guard.urls.has(normalizeClickCountUrl(url))
+  );
+}
+
+async function getHistoryClickCount(url) {
+  const normalizedUrl = normalizeClickCountUrl(url);
+  const historyItems = await chrome.history.search({
+    text: url,
+    startTime: 0,
+    maxResults: CLICK_COUNT_HISTORY_SEARCH_LIMIT,
+  });
+  const historyItem = (historyItems || []).find(item => (
+    normalizeClickCountUrl(item?.url) === normalizedUrl
+  ));
+  return {
+    clickCount: Math.max(0, Number(historyItem?.visitCount) || 0),
+    lastClickedAt: Number(historyItem?.lastVisitTime) || null,
+  };
+}
+
+// HistoryItem.visitCount is canonical. getVisits().length also includes
+// reload and redirect rows, so mixing the two APIs makes counts jump.
+async function enrichClickCounts(bookmarks, concurrency = 5) {
+  const itemsByUrl = new Map();
+  for (const item of bookmarks || []) {
+    const normalizedUrl = normalizeClickCountUrl(item?.url);
+    if (!normalizedUrl) continue;
+    if (!itemsByUrl.has(normalizedUrl)) itemsByUrl.set(normalizedUrl, []);
+    itemsByUrl.get(normalizedUrl).push(item);
+  }
+
+  const groups = await runWithConcurrency([...itemsByUrl.values()], concurrency, async (items) => {
+    try {
+      const counts = await getHistoryClickCount(items[0].url);
+      return items
+        .filter(item => (
+          counts.clickCount !== (item.clickCount || 0)
+          || counts.lastClickedAt !== (item.lastClickedAt || null)
+        ))
+        .map(item => ({ id: item.id, url: item.url, ...counts }));
+    } catch {
+      return [];
+    }
+  });
+  return groups.flat();
+}
+
+function applyClickCountUpdates(bookmarks, updates, guard = null) {
   const byId = new Map((updates || []).filter(item => item.id).map(item => [item.id, item]));
   const byUrl = new Map((updates || []).filter(item => item.url).map(item => [item.url, item]));
   for (const item of bookmarks || []) {
     const update = byId.get(item.id) || byUrl.get(item.url);
-    if (!update || update.url !== item.url) continue;
+    if (!update || update.url !== item.url || clickCountChangedDuringRefresh(item.url, guard)) continue;
     item.clickCount = update.clickCount;
     item.lastClickedAt = update.lastClickedAt;
   }
   return bookmarks;
 }
 
+async function applyStoredClickCountUpdates(bookmarks, guard) {
+  const updated = await enrichClickCounts(bookmarks, 10);
+  if (updated.length === 0) return { updated: 0 };
+
+  const updatesById = new Map(updated.filter(item => item.id).map(item => [item.id, item]));
+  const updatesByUrl = new Map(updated.filter(item => item.url).map(item => [item.url, item]));
+  let applied = 0;
+  await mutateStoredBookmarks((current) => current.map((item) => {
+    const update = updatesById.get(item.id) || updatesByUrl.get(item.url);
+    if (!update || update.url !== item.url || clickCountChangedDuringRefresh(item.url, guard)) return item;
+    if ((item.clickCount || 0) === update.clickCount && (item.lastClickedAt || null) === update.lastClickedAt) return item;
+    applied++;
+    return { ...item, clickCount: update.clickCount, lastClickedAt: update.lastClickedAt };
+  }));
+  return { updated: applied };
+}
+
+async function refreshStoredClickCountsForUrls(urls) {
+  const normalizedUrls = new Set((urls || []).map(normalizeClickCountUrl).filter(Boolean));
+  if (normalizedUrls.size === 0) return { updated: 0 };
+
+  const guard = beginClickCountRefreshGuard();
+  try {
+    await waitForStorageResourceMutations(STORAGE_KEY);
+    const bookmarks = (await getStoredBookmarks()).filter(item => (
+      normalizedUrls.has(normalizeClickCountUrl(item.url))
+    ));
+    return await applyStoredClickCountUpdates(bookmarks, guard);
+  } finally {
+    endClickCountRefreshGuard(guard);
+  }
+}
+
 let clickCountRefreshInFlight = null;
 async function refreshStoredClickCounts() {
   if (!clickCountRefreshInFlight) {
     clickCountRefreshInFlight = (async () => {
-      const bookmarks = await getStoredBookmarks();
-      const updated = await enrichClickCounts(bookmarks, 10);
-      if (updated.length > 0) {
-        const updatesById = new Map(updated.filter(item => item.id).map(item => [item.id, item]));
-        const updatesByUrl = new Map(updated.filter(item => item.url).map(item => [item.url, item]));
-        await mutateStoredBookmarks((current) => current.map((item) => {
-          const update = updatesById.get(item.id) || updatesByUrl.get(item.url);
-          if (!update || update.url !== item.url) return item;
-          return { ...item, clickCount: update.clickCount, lastClickedAt: update.lastClickedAt };
-        }));
+      const guard = beginClickCountRefreshGuard();
+      try {
+        await waitForStorageResourceMutations(STORAGE_KEY);
+        const bookmarks = await getStoredBookmarks();
+        const result = await applyStoredClickCountUpdates(bookmarks, guard);
+        await waitForStorageResourceMutations(STORAGE_KEY);
+        await chrome.storage.local.set({ [CLICK_COUNT_SOURCE_VERSION_KEY]: CLICK_COUNT_SOURCE_VERSION });
+        return result;
+      } finally {
+        endClickCountRefreshGuard(guard);
       }
-      return { updated: updated.length };
     })().finally(() => { clickCountRefreshInFlight = null; });
   }
   return clickCountRefreshInFlight;
+}
+
+let clickCountSourceMigrationInFlight = null;
+async function ensureClickCountSourceMigration() {
+  if (!clickCountSourceMigrationInFlight) {
+    clickCountSourceMigrationInFlight = (async () => {
+      let stored = await chrome.storage.local.get(CLICK_COUNT_SOURCE_VERSION_KEY);
+      if (Number(stored[CLICK_COUNT_SOURCE_VERSION_KEY]) >= CLICK_COUNT_SOURCE_VERSION) {
+        return { migrated: false };
+      }
+
+      if (syncAllInFlight) {
+        await syncAllInFlight.catch(() => undefined);
+        stored = await chrome.storage.local.get(CLICK_COUNT_SOURCE_VERSION_KEY);
+        if (Number(stored[CLICK_COUNT_SOURCE_VERSION_KEY]) >= CLICK_COUNT_SOURCE_VERSION) {
+          return { migrated: true };
+        }
+      }
+
+      const result = await refreshStoredClickCounts();
+      return { ...result, migrated: true };
+    })().finally(() => { clickCountSourceMigrationInFlight = null; });
+  }
+  return clickCountSourceMigrationInFlight;
 }
 
 // ===== RSS 文章 → 书签 互通 =====
@@ -5257,6 +5408,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     case 'getBookmarks':
       (async () => {
+        try {
+          await ensureClickCountSourceMigration();
+        } catch (error) {
+          console.warn('Click count source migration failed:', error);
+        }
         sendResponse({ success: true, bookmarks: await getStoredBookmarks() });
       })();
       return true;
@@ -7257,14 +7413,28 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
 // Chrome History 是访问次数的唯一来源；写入绝对值，避免一次导航被重复累加。
 chrome.history.onVisited.addListener((historyItem) => {
   if (!historyItem?.url || !Number.isFinite(Number(historyItem.visitCount))) return;
-  const normalizedUrl = historyItem.url.replace(/\/+$/, '');
+  const normalizedUrl = normalizeClickCountUrl(historyItem.url);
   const visitCount = Math.max(0, Number(historyItem.visitCount) || 0);
   const lastClickedAt = Number(historyItem.lastVisitTime) || null;
-  mutateStoredBookmarks((bookmarks) => bookmarks.map((item) => {
-    if (!item.url || item.url.replace(/\/+$/, '') !== normalizedUrl) return item;
+  noteClickCountHistoryVisit(historyItem.url, visitCount, lastClickedAt);
+  return mutateStoredBookmarks((bookmarks) => bookmarks.map((item) => {
+    if (!item.url || normalizeClickCountUrl(item.url) !== normalizedUrl) return item;
     if ((item.clickCount || 0) === visitCount && (item.lastClickedAt || null) === lastClickedAt) return item;
     return { ...item, clickCount: visitCount, lastClickedAt };
   })).catch(() => {});
+});
+
+chrome.history.onVisitRemoved.addListener((removed) => {
+  if (!removed || (!removed.allHistory && !Array.isArray(removed.urls))) return;
+  noteClickCountHistoryChange(removed.urls, removed.allHistory === true);
+  if (removed.allHistory) {
+    return mutateStoredBookmarks((bookmarks) => bookmarks.map((item) => (
+      (item.clickCount || 0) === 0 && (item.lastClickedAt || null) === null
+        ? item
+        : { ...item, clickCount: 0, lastClickedAt: null }
+    ))).catch(() => {});
+  }
+  return refreshStoredClickCountsForUrls(removed.urls).catch(() => {});
 });
 
 chrome.runtime.onStartup.addListener(() => {
