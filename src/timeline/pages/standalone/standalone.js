@@ -349,13 +349,26 @@ async function fetchBookmarks() {
 }
 
 async function refreshBookmarkData({ keepFilter = true } = {}) {
-  await chrome.runtime.sendMessage({ action: 'refreshClickCounts' }).catch(() => {});
   const bookmarks = await fetchBookmarks();
   allBookmarks = bookmarks;
   duplicateIds = computeDuplicates(allBookmarks);
   await collectAllTags();
   renderTagFilter();
   filterBookmarks(saSearchInput.value);
+}
+
+let clickCountBackgroundRefreshInFlight = null;
+function refreshClickCountsInBackground() {
+  if (!clickCountBackgroundRefreshInFlight) {
+    clickCountBackgroundRefreshInFlight = (async () => {
+      if (allBookmarks.length === 0) return;
+      const result = await chrome.runtime.sendMessage({ action: 'refreshClickCounts' });
+      if (result?.success) await refreshBookmarkData({ keepFilter: true });
+    })()
+      .catch((error) => console.warn('Click count background refresh failed:', error))
+      .finally(() => { clickCountBackgroundRefreshInFlight = null; });
+  }
+  return clickCountBackgroundRefreshInFlight;
 }
 
 let focusRefreshInFlight = null;
@@ -2462,6 +2475,7 @@ async function startApp() {
   try {
     await loadFolderTree();
     await refreshBookmarkData({ keepFilter: false });
+    void refreshClickCountsInBackground();
   } catch (e) {
     console.error('Failed to initialize:', e);
     showToast(i18n('loadFailedRetry'), 'error');

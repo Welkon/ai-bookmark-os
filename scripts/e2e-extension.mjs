@@ -598,6 +598,22 @@ try {
         });
       });
     }
+    if (label === 'workspace') {
+      await worker.evaluate(() => {
+        const originalRefreshStoredClickCounts = refreshStoredClickCounts;
+        globalThis.__e2eWorkspaceCountRefresh = { startedAt: 0, finishedAt: 0 };
+        refreshStoredClickCounts = async (...args) => {
+          globalThis.__e2eWorkspaceCountRefresh.startedAt = Date.now();
+          await new Promise(resolve => setTimeout(resolve, 5000));
+          try {
+            return await originalRefreshStoredClickCounts(...args);
+          } finally {
+            globalThis.__e2eWorkspaceCountRefresh.finishedAt = Date.now();
+            refreshStoredClickCounts = originalRefreshStoredClickCounts;
+          }
+        };
+      });
+    }
     let page;
     if (label === 'graph') {
       const popup = await openExtensionPage(context, extensionId, 'pages/popup/popup.html', pageErrors);
@@ -613,6 +629,18 @@ try {
     await page.locator('body').filter({ hasText: textPattern }).waitFor({ timeout: 10000 });
     await assertNoHorizontalOverflow(page, label);
     if (label === 'workspace') {
+      await page.locator('.sa-bookmark-item').first().waitFor({ timeout: 3000 });
+      let countRefreshProbe;
+      const probeDeadline = Date.now() + 1000;
+      do {
+        countRefreshProbe = await worker.evaluate(() => globalThis.__e2eWorkspaceCountRefresh);
+        if (countRefreshProbe?.startedAt) break;
+        await new Promise(resolve => setTimeout(resolve, 25));
+      } while (Date.now() < probeDeadline);
+      assert.ok(countRefreshProbe?.startedAt > 0, 'workspace did not start asynchronous count reconciliation');
+      assert.equal(countRefreshProbe.finishedAt, 0, 'workspace waited for count reconciliation before rendering bookmarks');
+      assert.equal(await page.locator('#saEmpty').isVisible(), false, 'workspace displayed an empty state while cached bookmarks existed');
+      assert.ok(Number(await page.locator('#saBookmarkCount').innerText()) > 0, 'workspace cached bookmark count was not rendered');
       await page.locator('.sa-view-btn[data-view="grid"]').click();
       await page.locator('.sa-grid-card').first().waitFor({ timeout: 10000 });
       await page.locator('.sa-grid-card .sa-bookmark-tag').first().waitFor({ timeout: 10000 });
@@ -625,6 +653,14 @@ try {
         tag: '.sa-grid-card .sa-bookmark-tag',
       });
       await page.screenshot({ path: join(artifactsPath, 'workspace-grid-desktop.png'), fullPage: true });
+      await page.waitForFunction(() => document.querySelectorAll('.sa-grid-card').length > 0);
+      const refreshDeadline = Date.now() + 10000;
+      while (Date.now() < refreshDeadline) {
+        countRefreshProbe = await worker.evaluate(() => globalThis.__e2eWorkspaceCountRefresh);
+        if (countRefreshProbe?.finishedAt) break;
+        await new Promise(resolve => setTimeout(resolve, 50));
+      }
+      assert.ok(countRefreshProbe?.finishedAt > countRefreshProbe?.startedAt, 'workspace count reconciliation did not finish');
     }
     if (label === 'graph') {
       await page.locator('#graphLoading').waitFor({ state: 'hidden', timeout: 10000 });

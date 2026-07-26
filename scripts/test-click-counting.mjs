@@ -243,4 +243,35 @@ assert.match(syncSource, /applyClickCountUpdates\(merged, clickCountUpdates, cli
 assert.match(syncSource, /clickCountChangedDuringRefresh\(item\.url, clickCountRefreshGuard\)/, 'full sync must preserve current counts changed during its query');
 assert.match(syncSource, /getLatestClickCountDuringRefresh\(item\.url, clickCountRefreshGuard\)/, 'full sync must retain a live count for newly mirrored bookmarks');
 
+const standaloneRefreshStart = standaloneSource.indexOf('async function refreshBookmarkData(');
+const standaloneRefreshEnd = standaloneSource.indexOf('let clickCountBackgroundRefreshInFlight', standaloneRefreshStart);
+const standaloneRefreshSource = standaloneSource.slice(standaloneRefreshStart, standaloneRefreshEnd);
+assert.ok(standaloneRefreshStart >= 0 && standaloneRefreshEnd > standaloneRefreshStart);
+assert.doesNotMatch(
+  standaloneRefreshSource,
+  /refreshClickCounts/,
+  'workspace cache rendering must not wait for a full History scan',
+);
+
+const standaloneCountRefreshStart = standaloneSource.indexOf('function refreshClickCountsInBackground(');
+const standaloneCountRefreshEnd = standaloneSource.indexOf('let focusRefreshInFlight', standaloneCountRefreshStart);
+const standaloneCountRefreshSource = standaloneSource.slice(standaloneCountRefreshStart, standaloneCountRefreshEnd);
+assert.ok(standaloneCountRefreshStart >= 0 && standaloneCountRefreshEnd > standaloneCountRefreshStart);
+assert.match(standaloneCountRefreshSource, /action:\s*['"]refreshClickCounts['"]/);
+assert.match(standaloneCountRefreshSource, /await refreshBookmarkData\(\{ keepFilter:\s*true \}\)/);
+
+const standaloneStartAppStart = standaloneSource.indexOf('async function startApp()');
+const standaloneStartAppEnd = standaloneSource.indexOf('// AI Bookmark OS entry', standaloneStartAppStart);
+const standaloneStartAppSource = standaloneSource.slice(standaloneStartAppStart, standaloneStartAppEnd);
+assert.ok(
+  standaloneStartAppSource.indexOf('await refreshBookmarkData({ keepFilter: false })')
+    < standaloneStartAppSource.indexOf('void refreshClickCountsInBackground()'),
+  'workspace must render cached bookmarks before starting count reconciliation',
+);
+assert.doesNotMatch(
+  standaloneStartAppSource,
+  /await refreshClickCountsInBackground\(\)/,
+  'workspace first paint must not await count reconciliation',
+);
+
 console.log('click counting tests passed');
