@@ -1179,6 +1179,7 @@
               <button id="clearLearningRecordsBtn" class="btn btn-danger btn-sm" type="button" data-i18n="clearLearningRecords">Clear learning records</button>
             </div>
           </div>
+          <div id="learningFeedbackControls" class="active-learning-list-controls" hidden></div>
           <div id="learningFeedbackList" class="learning-feedback-list" aria-live="polite" hidden></div>
         </div>
 
@@ -1200,7 +1201,9 @@
             <button type="button" role="tab" aria-selected="false" data-state="conflicted">冲突</button>
             <button type="button" role="tab" aria-selected="false" data-state="disabled">停用</button>
           </div>
+          <div id="recommendationRulesControls" class="active-learning-list-controls" hidden></div>
           <div id="recommendationRulesList" class="tagrule-list" aria-live="polite"></div>
+          <div id="reevaluationControls" class="active-learning-list-controls" hidden></div>
           <div id="reevaluationResults" class="reevaluation-results" aria-live="polite"></div>
         </div>
 
@@ -1219,6 +1222,7 @@
                 <button id="clearReviewQueueBtn" class="btn btn-danger btn-sm" type="button" data-i18n="clearQueue">Clear pending reviews</button>
               </div>
             </div>
+            <div id="pendingReviewsControls" class="active-learning-list-controls active-learning-list-controls--embedded" hidden></div>
             <div id="pendingReviewsList" class="review-list"></div>
           </div>
         </div>

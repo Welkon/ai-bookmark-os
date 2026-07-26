@@ -81,17 +81,21 @@ const activeLearningBadge = document.getElementById('activeLearningBadge');
 const learningStatsDesc = document.getElementById('learningStatsDesc');
 const viewLearningRecordsBtn = document.getElementById('viewLearningRecordsBtn');
 const clearLearningRecordsBtn = document.getElementById('clearLearningRecordsBtn');
+const learningFeedbackControls = document.getElementById('learningFeedbackControls');
 const learningFeedbackList = document.getElementById('learningFeedbackList');
 const selectAllPendingReviews = document.getElementById('selectAllPendingReviews');
 const pendingReviewSelectionCount = document.getElementById('pendingReviewSelectionCount');
 const confirmSelectedReviewsBtn = document.getElementById('confirmSelectedReviewsBtn');
 const clearReviewQueueBtn = document.getElementById('clearReviewQueueBtn');
+const pendingReviewsControls = document.getElementById('pendingReviewsControls');
 const pendingReviewsList = document.getElementById('pendingReviewsList');
 const recommendationRuleTabs = document.getElementById('recommendationRuleTabs');
+const recommendationRulesControls = document.getElementById('recommendationRulesControls');
 const recommendationRulesList = document.getElementById('recommendationRulesList');
 const undoRecommendationLearningBtn = document.getElementById('undoRecommendationLearningBtn');
 const rebuildRecommendationLearningBtn = document.getElementById('rebuildRecommendationLearningBtn');
 const reevaluateBookmarksBtn = document.getElementById('reevaluateBookmarksBtn');
+const reevaluationControls = document.getElementById('reevaluationControls');
 const reevaluationResults = document.getElementById('reevaluationResults');
 const aboutVersion = document.getElementById('aboutVersion');
 
@@ -2828,6 +2832,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   loadAISettings();
   bindTreeSettings();
   loadTreeSettings();
+  initializeActiveLearningListControls();
   loadActiveLearning();
   loadNotificationSettings();
   loadRssSettings();
@@ -3117,10 +3122,157 @@ let reevaluationItems = new Map();
 let reevaluationSelected = new Set();
 let reevaluationCancelled = false;
 let reevaluationApplying = false;
+let reevaluationProgressText = '';
+let reevaluationIsEvaluating = false;
 let learningFeedbackExpanded = false;
 let pendingReviewQueue = [];
 let pendingReviewSelected = new Set();
+let pendingReviewTagDrafts = new Map();
 let pendingReviewBatching = false;
+
+const ACTIVE_LEARNING_PAGE_SIZES = Object.freeze([10, 20, 50, 100]);
+
+function createActiveLearningListState() {
+  return { query: '', page: 1, pageSize: 10 };
+}
+
+function normalizeActiveLearningSearchValue(value) {
+  return String(value ?? '').trim().toLocaleLowerCase();
+}
+
+function paginateActiveLearningItems(items, state, getSearchText) {
+  const source = Array.isArray(items) ? items : [];
+  const query = normalizeActiveLearningSearchValue(state?.query);
+  const pageSize = ACTIVE_LEARNING_PAGE_SIZES.includes(Number(state?.pageSize))
+    ? Number(state.pageSize)
+    : ACTIVE_LEARNING_PAGE_SIZES[0];
+  const filtered = query
+    ? source.filter(item => normalizeActiveLearningSearchValue(getSearchText(item)).includes(query))
+    : source;
+  const pageCount = Math.max(1, Math.ceil(filtered.length / pageSize));
+  const requestedPage = Math.max(1, Math.trunc(Number(state?.page) || 1));
+  const page = Math.min(requestedPage, pageCount);
+  const startIndex = (page - 1) * pageSize;
+  if (state) {
+    state.page = page;
+    state.pageSize = pageSize;
+  }
+  return {
+    items: filtered.slice(startIndex, startIndex + pageSize),
+    sourceTotal: source.length,
+    filteredTotal: filtered.length,
+    page,
+    pageCount,
+    pageSize,
+    start: filtered.length > 0 ? startIndex + 1 : 0,
+    end: Math.min(startIndex + pageSize, filtered.length),
+  };
+}
+
+function activeLearningSearchText(parts) {
+  return (parts || []).flat(3).filter(value => value !== undefined && value !== null).map(String).join(' ');
+}
+
+const activeLearningListStates = {
+  learningFeedback: createActiveLearningListState(),
+  recommendationRules: createActiveLearningListState(),
+  pendingReviews: createActiveLearningListState(),
+  reevaluation: createActiveLearningListState(),
+};
+
+function getActiveLearningListControls(name) {
+  return {
+    learningFeedback: learningFeedbackControls,
+    recommendationRules: recommendationRulesControls,
+    pendingReviews: pendingReviewsControls,
+    reevaluation: reevaluationControls,
+  }[name] || null;
+}
+
+function rerenderActiveLearningList(name) {
+  if (name === 'learningFeedback') renderLearningFeedback(recommendationLearningState?.recentFeedback || []);
+  else if (name === 'recommendationRules') renderRecommendationRules();
+  else if (name === 'pendingReviews') renderPendingReviews(pendingReviewQueue);
+  else if (name === 'reevaluation') renderReevaluationResults(reevaluationItems, reevaluationProgressText, reevaluationIsEvaluating);
+}
+
+function updateActiveLearningListControls(name, pageInfo, visible = true) {
+  const controls = getActiveLearningListControls(name);
+  const state = activeLearningListStates[name];
+  if (!controls || !state) return;
+  controls.hidden = !visible || (pageInfo.sourceTotal === 0 && !state.query);
+  const searchInput = controls.querySelector('[data-role="search"]');
+  const pageSizeSelect = controls.querySelector('[data-role="page-size"]');
+  const summary = controls.querySelector('[data-role="summary"]');
+  const previous = controls.querySelector('[data-role="previous"]');
+  const next = controls.querySelector('[data-role="next"]');
+  const busy = (name === 'pendingReviews' && pendingReviewBatching)
+    || (name === 'reevaluation' && reevaluationApplying);
+  if (searchInput && searchInput.value !== state.query) searchInput.value = state.query;
+  if (searchInput) searchInput.disabled = busy;
+  if (pageSizeSelect) {
+    pageSizeSelect.value = String(pageInfo.pageSize);
+    pageSizeSelect.disabled = busy;
+  }
+  if (summary) {
+    summary.textContent = state.query
+      ? i18n('activeLearningFilteredPageSummary', [pageInfo.filteredTotal, pageInfo.sourceTotal, pageInfo.page, pageInfo.pageCount])
+      : i18n('activeLearningPageSummary', [pageInfo.start, pageInfo.end, pageInfo.sourceTotal, pageInfo.page, pageInfo.pageCount]);
+  }
+  if (previous) previous.disabled = busy || pageInfo.page <= 1;
+  if (next) next.disabled = busy || pageInfo.page >= pageInfo.pageCount;
+}
+
+function setActiveLearningListControlsDisabled(name, disabled) {
+  const controls = getActiveLearningListControls(name);
+  controls?.querySelectorAll('input, select, button').forEach(control => { control.disabled = disabled; });
+}
+
+function initializeActiveLearningListControls() {
+  const configurations = [
+    ['learningFeedback', learningFeedbackControls, 'searchLearningRecords'],
+    ['recommendationRules', recommendationRulesControls, 'searchRecommendationRules'],
+    ['pendingReviews', pendingReviewsControls, 'searchPendingReviews'],
+    ['reevaluation', reevaluationControls, 'searchReevaluationResults'],
+  ];
+  const previousLabel = i18n('previousPage');
+  const nextLabel = i18n('nextPage');
+  for (const [name, controls, searchKey] of configurations) {
+    if (!controls || controls.dataset.initialized === 'true') continue;
+    const searchLabel = i18n(searchKey);
+    controls.dataset.initialized = 'true';
+    controls.innerHTML = `
+      <label class="active-learning-search">
+        <span class="active-learning-search-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg></span>
+        <input class="active-learning-search-input" data-role="search" type="search" placeholder="${escapeHtml(searchLabel)}" aria-label="${escapeHtml(searchLabel)}">
+      </label>
+      <div class="active-learning-pagination">
+        <label class="active-learning-page-size"><span>${escapeHtml(i18n('recordsPerPage'))}</span><select data-role="page-size" aria-label="${escapeHtml(i18n('recordsPerPage'))}">${ACTIVE_LEARNING_PAGE_SIZES.map(size => `<option value="${size}">${size}</option>`).join('')}</select></label>
+        <span class="active-learning-page-summary" data-role="summary" aria-live="polite"></span>
+        <button class="active-learning-page-button" data-role="previous" type="button" title="${escapeHtml(previousLabel)}" aria-label="${escapeHtml(previousLabel)}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"></polyline></svg></button>
+        <button class="active-learning-page-button" data-role="next" type="button" title="${escapeHtml(nextLabel)}" aria-label="${escapeHtml(nextLabel)}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"></polyline></svg></button>
+      </div>`;
+    const state = activeLearningListStates[name];
+    controls.querySelector('[data-role="search"]')?.addEventListener('input', (event) => {
+      state.query = event.target.value;
+      state.page = 1;
+      rerenderActiveLearningList(name);
+    });
+    controls.querySelector('[data-role="page-size"]')?.addEventListener('change', (event) => {
+      state.pageSize = Number(event.target.value);
+      state.page = 1;
+      rerenderActiveLearningList(name);
+    });
+    controls.querySelector('[data-role="previous"]')?.addEventListener('click', () => {
+      state.page = Math.max(1, state.page - 1);
+      rerenderActiveLearningList(name);
+    });
+    controls.querySelector('[data-role="next"]')?.addEventListener('click', () => {
+      state.page += 1;
+      rerenderActiveLearningList(name);
+    });
+  }
+}
 
 function makeSettingsOperationId(prefix) {
   return `${prefix}_${globalThis.crypto?.randomUUID?.() || `${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`}`;
@@ -3153,11 +3305,26 @@ async function loadActiveLearning() {
 function renderRecommendationRules() {
   if (!recommendationRulesList) return;
   const rules = (recommendationLearningState?.rules || []).filter(rule => rule.state === recommendationRuleState);
-  if (rules.length === 0) {
-    recommendationRulesList.innerHTML = '<div class="tagrule-empty">当前状态暂无规则</div>';
+  const pageInfo = paginateActiveLearningItems(
+    rules,
+    activeLearningListStates.recommendationRules,
+    rule => activeLearningSearchText([
+      rule.pattern,
+      rule.kind,
+      rule.target,
+      rule.source,
+      rule.state,
+      rule.source === 'user' ? '手动' : rule.source === 'legacy' ? '旧版待验证' : '自动学习',
+      `确认 ${(rule.positiveFingerprints || []).length}`,
+      `反向 ${(rule.negativeFingerprints || []).length}`,
+    ]),
+  );
+  updateActiveLearningListControls('recommendationRules', pageInfo);
+  if (pageInfo.filteredTotal === 0) {
+    recommendationRulesList.innerHTML = `<div class="tagrule-empty">${escapeHtml(activeLearningListStates.recommendationRules.query ? i18n('noMatchingRecords') : '当前状态暂无规则')}</div>`;
     return;
   }
-  recommendationRulesList.innerHTML = rules.map(rule => {
+  recommendationRulesList.innerHTML = pageInfo.items.map(rule => {
     const positives = (rule.positiveFingerprints || []).length;
     const negatives = (rule.negativeFingerprints || []).length;
     const source = rule.source === 'user' ? '手动' : rule.source === 'legacy' ? '旧版待验证' : '自动学习';
@@ -3191,6 +3358,7 @@ function renderRecommendationRules() {
 if (recommendationRuleTabs) {
   recommendationRuleTabs.querySelectorAll('[data-state]').forEach(tab => tab.addEventListener('click', () => {
     recommendationRuleState = tab.dataset.state || 'candidate';
+    activeLearningListStates.recommendationRules.page = 1;
     recommendationRuleTabs.querySelectorAll('[data-state]').forEach(item => {
       const active = item === tab;
       item.classList.toggle('is-active', active);
@@ -3350,18 +3518,33 @@ async function applySelectedReevaluations(ids, requireConfirmation = true) {
       failures.push({ id: item.id, reason: result.reason });
     }
   }
+  reevaluationApplying = false;
   renderReevaluationResults(
     reevaluationItems,
     failures.length > 0 ? `应用完成：成功 ${succeeded}，失败 ${failures.length}` : `已成功应用 ${succeeded} 条建议`,
   );
-  reevaluationApplying = false;
   showToast(failures.length > 0 ? `部分应用失败：${failures.length} 条` : `已应用 ${succeeded} 条重新评估结果`, failures.length > 0 ? 'error' : 'success');
 }
 
 function renderReevaluationResults(items, progressText = '', evaluating = false) {
   if (!reevaluationResults) return;
+  reevaluationProgressText = progressText;
+  reevaluationIsEvaluating = evaluating;
   const values = [...items.values()];
-  const rows = values.map(item => {
+  const pageInfo = paginateActiveLearningItems(
+    values,
+    activeLearningListStates.reevaluation,
+    item => activeLearningSearchText([
+      item.title,
+      item.id,
+      item.reason,
+      item.folderPath,
+      item.recommendation?.folders?.map(folder => [folder.folderPath, folder.path, folder.confidence]),
+      item.recommendation?.tags?.map(tag => [tag.tag, tag.confidence]),
+    ]),
+  );
+  updateActiveLearningListControls('reevaluation', pageInfo);
+  const rows = pageInfo.items.map(item => {
     const recommendation = item.recommendation;
     const folder = recommendation?.folders?.[0];
     const tags = (recommendation?.tags || []).map(tag => tag.tag).join(', ');
@@ -3378,14 +3561,15 @@ function renderReevaluationResults(items, progressText = '', evaluating = false)
     ? `<div class="reevaluation-batch"><span>可应用 ${applicableCount} 条，已选 ${selectedCount} 条</span><button id="applySelectedReevaluationsBtn" class="btn btn-primary btn-sm" type="button" ${selectedCount === 0 || reevaluationApplying ? 'disabled' : ''}>应用已选</button></div>`
     : '';
   const cancel = evaluating ? ' <button id="cancelReevaluationBtn" class="btn btn-secondary btn-sm" type="button">取消</button>' : '';
-  reevaluationResults.innerHTML = `<div class="reevaluation-progress">${escapeHtml(progressText)}${cancel}</div>${batch}${rows || '<div class="tagrule-empty">暂无可显示结果</div>'}`;
+  const emptyText = activeLearningListStates.reevaluation.query ? i18n('noMatchingRecords') : '暂无可显示结果';
+  reevaluationResults.innerHTML = `<div class="reevaluation-progress">${escapeHtml(progressText)}${cancel}</div>${batch}${rows || `<div class="tagrule-empty">${escapeHtml(emptyText)}</div>`}`;
   reevaluationResults.querySelector('#cancelReevaluationBtn')?.addEventListener('click', () => { reevaluationCancelled = true; });
   reevaluationResults.querySelectorAll('.reevaluation-select input').forEach(checkbox => checkbox.addEventListener('change', () => {
     const id = checkbox.closest('.reevaluation-item')?.dataset.id;
     if (!id) return;
     if (checkbox.checked) reevaluationSelected.add(id);
     else reevaluationSelected.delete(id);
-    renderReevaluationResults(reevaluationItems, progressText);
+    renderReevaluationResults(reevaluationItems, progressText, evaluating);
   }));
   reevaluationResults.querySelector('#applySelectedReevaluationsBtn')?.addEventListener('click', () => {
     applySelectedReevaluations([...reevaluationSelected]).catch(() => showToast('批量应用失败', 'error'));
@@ -3430,12 +3614,11 @@ if (reevaluateBookmarksBtn) {
     reevaluationCancelled = false;
     reevaluationItems = new Map();
     reevaluationSelected = new Set();
+    activeLearningListStates.reevaluation.query = '';
+    activeLearningListStates.reevaluation.page = 1;
     const bookmarkResponse = await chrome.runtime.sendMessage({ action: 'getBookmarks' }).catch(() => null);
     const bookmarks = bookmarkResponse?.bookmarks || [];
-    if (reevaluationResults) {
-      reevaluationResults.innerHTML = '<div class="reevaluation-progress">准备重新评估… <button id="cancelReevaluationBtn" class="btn btn-secondary btn-sm" type="button">取消</button></div>';
-      reevaluationResults.querySelector('#cancelReevaluationBtn')?.addEventListener('click', () => { reevaluationCancelled = true; });
-    }
+    renderReevaluationResults(reevaluationItems, '准备重新评估…', true);
     for (let index = 0; index < bookmarks.length && !reevaluationCancelled; index += 10) {
       const chunk = bookmarks.slice(index, index + 10);
       const result = await chrome.runtime.sendMessage({ action: 'reevaluateBookmarks', ids: chunk.map(item => item.id), allowAI: false }).catch(() => null);
@@ -3494,21 +3677,45 @@ function renderLearningStats(stats, recommendationStats) {
 function renderLearningFeedback(records) {
   if (!learningFeedbackList || !viewLearningRecordsBtn) return;
   const items = Array.isArray(records) ? records : [];
-  learningFeedbackList.hidden = !learningFeedbackExpanded;
-  viewLearningRecordsBtn.textContent = i18n(learningFeedbackExpanded ? 'hideLearningRecords' : 'viewLearningRecords');
-  viewLearningRecordsBtn.setAttribute('aria-expanded', String(learningFeedbackExpanded));
-  if (items.length === 0) {
-    const hasLegacySummary = Number(recommendationLearningState?.stats?.total || 0) > 0;
-    learningFeedbackList.innerHTML = `<div class="tagrule-empty">${escapeHtml(i18n(hasLegacySummary ? 'learningRecordsUnavailable' : 'noLearningRecords'))}</div>`;
-    return;
-  }
   const outcomeKeys = {
     accepted: 'learningRecordAccepted',
     modified: 'learningRecordModified',
     rejected: 'learningRecordRejected',
     cancelled: 'learningRecordCancelled',
   };
-  learningFeedbackList.innerHTML = items.map((item) => {
+  learningFeedbackList.hidden = !learningFeedbackExpanded;
+  viewLearningRecordsBtn.textContent = i18n(learningFeedbackExpanded ? 'hideLearningRecords' : 'viewLearningRecords');
+  viewLearningRecordsBtn.setAttribute('aria-expanded', String(learningFeedbackExpanded));
+  const pageInfo = paginateActiveLearningItems(
+    items,
+    activeLearningListStates.learningFeedback,
+    item => activeLearningSearchText([
+      item.domain,
+      item.urlFingerprint,
+      item.recommendationId,
+      item.outcome,
+      i18n(outcomeKeys[item.outcome] || 'learningRecordCancelled'),
+      item.changedFields,
+      (item.changedFields || []).map(field => field === 'folder'
+        ? i18n('learningRecordFolder')
+        : (field === 'tags' ? i18n('learningRecordTags') : field)),
+      item.selection?.folderPath,
+      item.selection?.tags,
+      item.undone ? i18n('learningRecordUndone') : '',
+      new Date(Number(item.createdAt) || 0).toLocaleString(),
+    ]),
+  );
+  updateActiveLearningListControls('learningFeedback', pageInfo, learningFeedbackExpanded);
+  if (pageInfo.sourceTotal === 0) {
+    const hasLegacySummary = Number(recommendationLearningState?.stats?.total || 0) > 0;
+    learningFeedbackList.innerHTML = `<div class="tagrule-empty">${escapeHtml(i18n(hasLegacySummary ? 'learningRecordsUnavailable' : 'noLearningRecords'))}</div>`;
+    return;
+  }
+  if (pageInfo.filteredTotal === 0) {
+    learningFeedbackList.innerHTML = `<div class="tagrule-empty">${escapeHtml(i18n('noMatchingRecords'))}</div>`;
+    return;
+  }
+  learningFeedbackList.innerHTML = pageInfo.items.map((item) => {
     const identity = item.domain || String(item.urlFingerprint || '').slice(0, 16) || item.recommendationId || '—';
     const folderPath = item.selection?.folderPath || '';
     const tags = Array.isArray(item.selection?.tags) ? item.selection.tags.join(', ') : '';
@@ -3532,15 +3739,45 @@ function renderLearningFeedback(records) {
 function renderPendingReviews(queue) {
   pendingReviewQueue = Array.isArray(queue) ? queue : [];
   const confirmableIds = new Set(pendingReviewQueue.filter(isPendingReviewConfirmable).map(item => item.id));
+  const currentIds = new Set(pendingReviewQueue.map(item => item.id));
   pendingReviewSelected = new Set([...pendingReviewSelected].filter(id => confirmableIds.has(id)));
+  pendingReviewTagDrafts = new Map([...pendingReviewTagDrafts].filter(([id]) => currentIds.has(id)));
 
-  if (pendingReviewQueue.length === 0) {
+  const pageInfo = paginateActiveLearningItems(
+    pendingReviewQueue,
+    activeLearningListStates.pendingReviews,
+    item => activeLearningSearchText([
+      item.title,
+      item.url,
+      item.domain,
+      item.bookmarkId,
+      item.type,
+      item.source,
+      item.reason,
+      getReasonText(item.reason),
+      item.fromFolderPath,
+      item.toFolderPath,
+      item.suggestedTags,
+      item.type === 'move_observation' ? ['移动待复核', '来源待确认'] : '',
+      item.type === 'bookmark_recommendation' ? ['智能分类建议', recommendationConfidenceText(item.confidence), item.aiTriggered ? 'AI 辅助' : ''] : '',
+      item.recommendation?.folders?.map(folder => [folder.folderPath, folder.path, folder.confidence]),
+      item.recommendation?.tags?.map(tag => [tag.tag, tag.confidence]),
+    ]),
+  );
+  updateActiveLearningListControls('pendingReviews', pageInfo);
+
+  if (pageInfo.sourceTotal === 0) {
     pendingReviewsList.innerHTML = `<div class="tagrule-empty">${i18n('noPendingReviews') || '暂无待确认的书签'}</div>`;
     updatePendingReviewSelectionControls();
     return;
   }
+  if (pageInfo.filteredTotal === 0) {
+    pendingReviewsList.innerHTML = `<div class="tagrule-empty">${escapeHtml(i18n('noMatchingRecords'))}</div>`;
+    updatePendingReviewSelectionControls();
+    return;
+  }
 
-  pendingReviewsList.innerHTML = pendingReviewQueue.map(item => {
+  pendingReviewsList.innerHTML = pageInfo.items.map(item => {
     const selectionControl = renderPendingReviewSelection(item);
     if (item.type === 'move_observation') {
       return `<div class="review-item review-item--observation" data-id="${escapeHtml(item.id)}">
@@ -3585,6 +3822,9 @@ function renderPendingReviews(queue) {
     const reasonHtml = !isAI
       ? `<span class="review-reason">${escapeHtml(getReasonText(item.reason))}</span>`
       : '';
+    const tagDraft = pendingReviewTagDrafts.has(item.id)
+      ? pendingReviewTagDrafts.get(item.id)
+      : ((item.suggestedTags || [])[0] || '');
     return `
     <div class="review-item ${isAI ? 'review-item--ai' : ''}" data-id="${escapeHtml(item.id)}">
       ${selectionControl}
@@ -3602,7 +3842,7 @@ function renderPendingReviews(queue) {
         <span class="tagrule-item-tag">${escapeHtml((item.suggestedTags || []).join(', ') || i18n('noTag') || '无标签')}</span>
       </div>
       <div class="review-actions">
-        <input type="text" class="review-tag-input" placeholder="${i18n('tagPlaceholder') || '标签'}" value="${escapeHtml((item.suggestedTags || [])[0] || '')}">
+        <input type="text" class="review-tag-input" placeholder="${i18n('tagPlaceholder') || '标签'}" value="${escapeHtml(tagDraft)}">
         <button class="btn btn-primary btn-sm review-confirm" data-id="${escapeHtml(item.id)}">
           <span>${i18n('confirm') || '确认'}</span>
         </button>
@@ -3623,6 +3863,12 @@ function renderPendingReviews(queue) {
       updatePendingReviewSelectionControls();
     });
   });
+  pendingReviewsList.querySelectorAll('.review-tag-input').forEach(input => {
+    input.addEventListener('input', () => {
+      const id = input.closest('.review-item')?.dataset.id;
+      if (id) pendingReviewTagDrafts.set(id, input.value);
+    });
+  });
   pendingReviewsList.querySelectorAll('.review-confirm').forEach(btn => {
     btn.addEventListener('click', () => onConfirmReview(btn.dataset.id, false));
   });
@@ -3639,6 +3885,7 @@ function renderPendingReviews(queue) {
     ));
   });
   updatePendingReviewSelectionControls();
+  if (pendingReviewBatching) setPendingReviewControlsDisabled(true);
 }
 
 function isPendingReviewConfirmable(item) {
@@ -3659,16 +3906,19 @@ function renderPendingReviewSelection(item) {
 }
 
 function updatePendingReviewSelectionControls() {
-  const selectable = [...pendingReviewsList.querySelectorAll('.pending-review-checkbox:not(:disabled)')];
-  const selectedCount = selectable.filter(checkbox => checkbox.checked).length;
-  selectAllPendingReviews.checked = selectable.length > 0 && selectedCount === selectable.length;
-  selectAllPendingReviews.indeterminate = selectedCount > 0 && selectedCount < selectable.length;
-  selectAllPendingReviews.disabled = pendingReviewBatching || selectable.length === 0;
-  pendingReviewSelectionCount.textContent = i18n('pendingReviewSelectionCount', [selectedCount]);
-  confirmSelectedReviewsBtn.textContent = selectedCount > 0
-    ? i18n('confirmSelectedReviewsCount', [selectedCount])
+  const pageSelectable = [...pendingReviewsList.querySelectorAll('.pending-review-checkbox:not(:disabled)')];
+  const pageSelectedCount = pageSelectable.filter(checkbox => checkbox.checked).length;
+  const totalSelectedCount = pendingReviewQueue.filter(item => (
+    pendingReviewSelected.has(item.id) && isPendingReviewConfirmable(item)
+  )).length;
+  selectAllPendingReviews.checked = pageSelectable.length > 0 && pageSelectedCount === pageSelectable.length;
+  selectAllPendingReviews.indeterminate = pageSelectedCount > 0 && pageSelectedCount < pageSelectable.length;
+  selectAllPendingReviews.disabled = pendingReviewBatching || pageSelectable.length === 0;
+  pendingReviewSelectionCount.textContent = i18n('pendingReviewSelectionCount', [totalSelectedCount]);
+  confirmSelectedReviewsBtn.textContent = totalSelectedCount > 0
+    ? i18n('confirmSelectedReviewsCount', [totalSelectedCount])
     : i18n('confirmSelectedReviews');
-  confirmSelectedReviewsBtn.disabled = pendingReviewBatching || selectedCount === 0;
+  confirmSelectedReviewsBtn.disabled = pendingReviewBatching || totalSelectedCount === 0;
   clearReviewQueueBtn.disabled = pendingReviewBatching;
 }
 
@@ -3771,13 +4021,14 @@ confirmSelectedReviewsBtn?.addEventListener('click', async () => {
     .filter(item => pendingReviewSelected.has(item.id) && isPendingReviewConfirmable(item))
     .map(item => ({
       item,
-      tag: pendingReviewsList.querySelector(`.review-item[data-id="${CSS.escape(item.id)}"] .review-tag-input`)?.value.trim() || '',
+      tag: String(pendingReviewTagDrafts.get(item.id) ?? (item.suggestedTags || [])[0] ?? '').trim(),
     }));
   if (selectedReviews.length === 0) return;
   if (!confirm(i18n('confirmSelectedReviewsPrompt', [selectedReviews.length]))) return;
 
   pendingReviewBatching = true;
   updatePendingReviewSelectionControls();
+  setActiveLearningListControlsDisabled('pendingReviews', true);
   setPendingReviewControlsDisabled(true);
   let succeeded = 0;
   let failed = 0;
@@ -3795,8 +4046,7 @@ confirmSelectedReviewsBtn?.addEventListener('click', async () => {
 
   await loadActiveLearning();
   pendingReviewBatching = false;
-  setPendingReviewControlsDisabled(false);
-  updatePendingReviewSelectionControls();
+  renderPendingReviews(pendingReviewQueue);
   showToast(
     failed > 0
       ? i18n('batchConfirmReviewsPartial', [succeeded, failed])

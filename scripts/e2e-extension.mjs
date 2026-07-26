@@ -471,8 +471,67 @@ try {
   await settings.keyboard.press('Tab');
   assert.equal(await settings.evaluate(() => document.activeElement?.matches('button, input, select, textarea, a[href]')), true, 'keyboard focus did not reach an interactive control');
 
+    const seededBatchReviewIds = await worker.evaluate(async () => {
+      const now = Date.now();
+      const stored = await chrome.storage.local.get('bookmark_timeline_data');
+      const bookmarks = stored.bookmark_timeline_data || [];
+      const batchBookmarks = ['Synthetic Batch One', 'Synthetic Batch Two'].map((title) => {
+        const bookmark = bookmarks.find(item => item.title === title);
+        if (!bookmark) throw new Error(`batch review bookmark was not mirrored: ${title}`);
+        return bookmark;
+      });
+      const targetNode = (await chrome.bookmarks.search({ title: 'E2E Batch Target' })).find(node => !node.url);
+      const target = (await loadBookmarkFolderOptions()).find(item => item.id === targetNode?.id);
+      if (!target) throw new Error('batch review target folder was not indexed');
+      const snapshots = batchBookmarks.map((bookmark, index) => ({
+        recommendationId: `recommendation-e2e-batch-${index + 1}`,
+        ruleVersion: 'bookmark-recommendation-v3',
+        urlFingerprint: recommendationUrlFingerprint(bookmark.url),
+        domain: 'batch.example',
+        pathSegments: [index === 0 ? 'one' : 'two'],
+        tags: [{ tag: 'E2E Batch Tag', support: 0.95, confidence: 'high' }],
+        folders: [{ id: target.id, folderPath: target.path, existing: true, support: 0.95, confidence: 'high' }],
+        selectedTags: ['E2E Batch Tag'],
+        selectedFolderPath: target.path,
+        createdAt: now,
+      }));
+      await mutateStorageResource(RECOMMENDATION_STORE_KEY, (current) => {
+        const store = normalizeRecommendationStore(current, now);
+        store.snapshots = [
+          ...store.snapshots.filter(item => !item.recommendationId?.startsWith('recommendation-e2e-batch-')),
+          ...snapshots,
+        ];
+        store.reviewQueue = [
+          ...store.reviewQueue.filter(item => !item.id?.startsWith('review-e2e-batch-')),
+          ...batchBookmarks.map((bookmark, index) => ({
+            id: `review-e2e-batch-${index + 1}`,
+            type: 'bookmark_recommendation',
+            bookmarkId: bookmark.id,
+            recommendationId: snapshots[index].recommendationId,
+            title: bookmark.title,
+            urlFingerprint: snapshots[index].urlFingerprint,
+            fromFolderPath: bookmark.folderPath,
+            toFolderId: target.id,
+            toFolderPath: target.path,
+            sourceParentId: bookmark.parentId,
+            sourceTags: [],
+            confidence: 'high',
+            createdAt: now,
+            updatedAt: now,
+          })),
+        ];
+        return store;
+      });
+      return (await getRecommendationLearningState()).reviewQueue
+        .filter(item => item.id.startsWith('review-e2e-batch-'))
+        .map(item => item.id)
+        .sort();
+    });
+    assert.deepEqual(seededBatchReviewIds, ['review-e2e-batch-1', 'review-e2e-batch-2']);
+    await settings.evaluate(() => loadActiveLearning());
     await settings.locator('[data-panel="activelearning"]').click();
     await settings.locator('#panel-activelearning').waitFor({ state: 'visible' });
+    await settings.waitForFunction(() => document.querySelectorAll('#pendingReviewsList .review-item[data-id^="review-e2e-batch-"] .pending-review-checkbox:not(:disabled)').length === 2);
     assert.equal(await settings.locator('#recommendationRuleTabs [role="tab"]').count(), 4);
     const pendingReviewCheckboxes = settings.locator('#pendingReviewsList .pending-review-checkbox:not(:disabled)');
     const batchReviewCheckboxes = settings.locator('#pendingReviewsList .review-item[data-id^="review-e2e-batch-"] .pending-review-checkbox:not(:disabled)');
@@ -496,6 +555,10 @@ try {
     await settings.locator('#confirmSelectedReviewsBtn').click();
     await settings.locator('.toast').filter({ hasText: /已批量确认 2 条书签|2 bookmarks confirmed/i }).waitFor({ timeout: 10000 });
     await settings.locator('#pendingReviewsList .review-item[data-id^="review-e2e-batch-"]').waitFor({ state: 'detached', timeout: 10000 });
+    assert.equal(await settings.locator('#pendingReviewsControls [data-role="search"]').isDisabled(), false, 'pending review search stayed disabled after batch confirmation');
+    assert.equal(await settings.locator('#pendingReviewsControls [data-role="page-size"]').isDisabled(), false, 'pending review page size stayed disabled after batch confirmation');
+    assert.equal(await settings.locator('#pendingReviewsControls [data-role="previous"]').isDisabled(), true, 'pending review previous page must stay disabled on the first page');
+    assert.equal(await settings.locator('#pendingReviewsControls [data-role="next"]').isDisabled(), true, 'pending review next page must stay disabled on the final page');
     const batchResult = await worker.evaluate(async () => {
       const tree = await chrome.bookmarks.getTree();
       const allNodes = [];
@@ -532,6 +595,176 @@ try {
   assert.match(learningFeedbackText, /rejected\.example[\s\S]*(拒绝|Rejected)/i);
   assert.match(learningFeedbackText, /cancelled\.example[\s\S]*(取消|Cancelled)/i);
     assert.doesNotMatch(learningFeedbackText, /https?:\/\//i, 'learning feedback details must not expose original URLs');
+    await settings.evaluate(() => {
+      const now = Date.now();
+      recommendationRuleState = 'candidate';
+      recommendationLearningState = {
+        ...(recommendationLearningState || {}),
+        recentFeedback: Array.from({ length: 105 }, (_, index) => ({
+          id: `pagination-feedback-${index + 1}`,
+          recommendationId: `pagination-recommendation-${index + 1}`,
+          domain: `feedback-${String(index + 1).padStart(2, '0')}.example`,
+          outcome: index % 2 === 0 ? 'accepted' : 'modified',
+          changedFields: index % 2 === 0 ? ['folder'] : ['tags'],
+          selection: { folderPath: `Pagination/Folder ${index + 1}`, tags: [`Pagination Tag ${index + 1}`] },
+          createdAt: now - index * 1000,
+        })),
+        rules: Array.from({ length: 105 }, (_, index) => ({
+          id: `pagination-rule-${index + 1}`,
+          pattern: `pagination-rule-${String(index + 1).padStart(2, '0')}.example`,
+          kind: 'domain_tag',
+          target: `Pagination Tag ${index + 1}`,
+          source: 'learned',
+          state: 'candidate',
+          positiveFingerprints: [],
+          negativeFingerprints: [],
+        })),
+      };
+      renderLearningFeedback(recommendationLearningState.recentFeedback);
+      renderRecommendationRules();
+      globalThis.__e2ePendingPaginationRecords = Array.from({ length: 105 }, (_, index) => ({
+        id: `pagination-review-${index + 1}`,
+        title: `Pagination Review ${String(index + 1).padStart(2, '0')}`,
+        url: `https://pagination-review-${index + 1}.example`,
+        confidence: 0.7,
+        score: 70,
+        reason: 'low_confidence',
+        suggestedTags: [`Pagination Tag ${index + 1}`],
+      }));
+      renderPendingReviews(globalThis.__e2ePendingPaginationRecords);
+      reevaluationItems = new Map(Array.from({ length: 105 }, (_, index) => {
+        const id = `pagination-result-${index + 1}`;
+        return [id, {
+          id,
+          title: `Pagination Result ${String(index + 1).padStart(2, '0')}`,
+          reason: 'medium_confidence',
+          recommendation: {
+            folders: [{ folderPath: `Pagination/Folder ${index + 1}`, confidence: 'medium', exists: false }],
+            tags: [{ tag: `Pagination Tag ${index + 1}`, confidence: 'medium' }],
+          },
+        }];
+      }));
+      reevaluationSelected = new Set();
+      renderReevaluationResults(reevaluationItems, '评估完成，共 105 条结果');
+    });
+
+    const listScenarios = [
+      ['learningFeedbackControls', '#learningFeedbackList .learning-feedback-item', 'feedback-105.example'],
+      ['recommendationRulesControls', '#recommendationRulesList .recommendation-rule-item', 'pagination-rule-105.example'],
+      ['pendingReviewsControls', '#pendingReviewsList .review-item', 'Pagination Review 105'],
+      ['reevaluationControls', '#reevaluationResults .reevaluation-item', 'Pagination Result 105'],
+    ];
+    for (const [controlsId, itemSelector, searchTerm] of listScenarios) {
+      const controls = settings.locator(`#${controlsId}`);
+      const previousPage = controls.locator('[data-role="previous"]');
+      const nextPage = controls.locator('[data-role="next"]');
+      assert.equal(await controls.isVisible(), true, `${controlsId} must be visible for populated records`);
+      assert.equal(await settings.locator(itemSelector).count(), 10, `${controlsId} must default to 10 records per page`);
+      assert.equal(await previousPage.isDisabled(), true, `${controlsId} previous page must be disabled initially`);
+      assert.equal(await nextPage.isDisabled(), false, `${controlsId} next page must be enabled initially`);
+      for (const pageSize of [20, 50, 100]) {
+        await controls.locator('[data-role="page-size"]').selectOption(String(pageSize));
+        assert.equal(await settings.locator(itemSelector).count(), pageSize, `${controlsId} must support ${pageSize} records per page`);
+        assert.equal(await previousPage.isDisabled(), true, `${controlsId} page-size changes must reset to the first page`);
+      }
+      await nextPage.click();
+      assert.equal(await settings.locator(itemSelector).count(), 5, `${controlsId} must render the final partial page`);
+      assert.equal(await previousPage.isDisabled(), false, `${controlsId} previous page must be enabled on the final page`);
+      assert.equal(await nextPage.isDisabled(), true, `${controlsId} next page must be disabled on the final page`);
+      await controls.locator('[data-role="search"]').fill(searchTerm);
+      assert.equal(await settings.locator(itemSelector).count(), 1, `${controlsId} search must filter the complete record set`);
+      assert.match(await settings.locator(itemSelector).first().innerText(), new RegExp(searchTerm.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i'));
+      assert.equal(await previousPage.isDisabled(), true, `${controlsId} search must reset to the first page`);
+      assert.equal(await nextPage.isDisabled(), true, `${controlsId} single-result search must have no next page`);
+      await controls.locator('[data-role="search"]').fill('record-that-does-not-exist');
+      assert.equal(await settings.locator(itemSelector).count(), 0, `${controlsId} must render an empty search result`);
+      assert.match(await controls.locator('xpath=following-sibling::*[1]').innerText(), /没有匹配的记录|No matching records/i);
+      await controls.locator('[data-role="search"]').fill('');
+      await controls.locator('[data-role="page-size"]').selectOption('10');
+    }
+
+    const pendingControls = settings.locator('#pendingReviewsControls');
+    const pendingPaginationState = await settings.evaluate(() => {
+      const dispatchInput = (input, value) => {
+        input.value = value;
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+      };
+      renderPendingReviews(globalThis.__e2ePendingPaginationRecords);
+      const pageSize = pendingReviewsControls.querySelector('[data-role="page-size"]');
+      pageSize.value = '10';
+      pageSize.dispatchEvent(new Event('change', { bubbles: true }));
+
+      let item = pendingReviewsList.querySelector('.review-item');
+      item.querySelector('.pending-review-checkbox').click();
+      dispatchInput(item.querySelector('.review-tag-input'), 'Pagination Draft Preserved');
+      pendingReviewsControls.querySelector('[data-role="next"]').click();
+
+      item = pendingReviewsList.querySelector('.review-item');
+      item.querySelector('.pending-review-checkbox').click();
+      dispatchInput(item.querySelector('.review-tag-input'), 'Pagination Page Two Draft');
+      pendingReviewsControls.querySelector('[data-role="previous"]').click();
+
+      item = pendingReviewsList.querySelector('.review-item');
+      const firstPage = {
+        checked: item.querySelector('.pending-review-checkbox').checked,
+        draft: item.querySelector('.review-tag-input').value,
+      };
+      pendingReviewsControls.querySelector('[data-role="next"]').click();
+      item = pendingReviewsList.querySelector('.review-item');
+      const secondPage = {
+        checked: item.querySelector('.pending-review-checkbox').checked,
+        draft: item.querySelector('.review-tag-input').value,
+      };
+      pendingReviewsControls.querySelector('[data-role="previous"]').click();
+      return { firstPage, secondPage, selectedCount: pendingReviewSelected.size };
+    });
+    assert.deepEqual(pendingPaginationState, {
+      firstPage: { checked: true, draft: 'Pagination Draft Preserved' },
+      secondPage: { checked: true, draft: 'Pagination Page Two Draft' },
+      selectedCount: 2,
+    });
+    assert.equal(await pendingControls.locator('[data-role="previous"]').isDisabled(), true);
+    await settings.screenshot({ path: join(artifactsPath, 'learning-pagination-desktop.png'), fullPage: true });
+    await assertNoHorizontalOverflow(settings, 'learning pagination desktop');
+
+    const reevaluationApplication = await settings.evaluate(async () => {
+      const response = await chrome.runtime.sendMessage({ action: 'getBookmarks' });
+      const bookmark = (response?.bookmarks || []).find(item => item.title === 'Synthetic React');
+      if (!bookmark) throw new Error('reevaluation application fixture was not found');
+      const item = {
+        ...bookmark,
+        recommendation: {
+          recommendationId: 'recommendation-e2e-reevaluation-apply',
+          folders: [],
+          tags: [{ tag: 'E2E Reevaluation Applied', confidence: 'high' }],
+        },
+      };
+      reevaluationItems = new Map([[item.id, item]]);
+      reevaluationSelected = new Set([item.id]);
+      Object.assign(activeLearningListStates.reevaluation, createActiveLearningListState());
+      renderReevaluationResults(reevaluationItems, 'Ready to apply');
+      await applySelectedReevaluations([item.id], false);
+      return { applying: reevaluationApplying, remaining: reevaluationItems.size };
+    });
+    assert.deepEqual(reevaluationApplication, { applying: false, remaining: 0 });
+    assert.equal(await settings.locator('#reevaluationControls [data-role="search"]').isDisabled(), false, 'reevaluation search stayed disabled after applying results');
+    assert.equal(await settings.locator('#reevaluationControls [data-role="page-size"]').isDisabled(), false, 'reevaluation page size stayed disabled after applying results');
+    assert.equal(await settings.locator('#reevaluationControls [data-role="previous"]').isDisabled(), true, 'reevaluation previous page must stay disabled without remaining results');
+    assert.equal(await settings.locator('#reevaluationControls [data-role="next"]').isDisabled(), true, 'reevaluation next page must stay disabled without remaining results');
+    const appliedReevaluation = await worker.evaluate(async () => {
+      const stored = await chrome.storage.local.get('bookmark_timeline_data');
+      return (stored.bookmark_timeline_data || []).find(item => item.title === 'Synthetic React')?.tags || [];
+    });
+    assert.equal(appliedReevaluation.includes('E2E Reevaluation Applied'), true, 'reevaluation result did not update the bookmark tag');
+
+    await settings.evaluate(async () => {
+      for (const state of Object.values(activeLearningListStates)) Object.assign(state, createActiveLearningListState());
+      pendingReviewSelected = new Set();
+      pendingReviewTagDrafts = new Map();
+      reevaluationItems = new Map();
+      reevaluationSelected = new Set();
+      await loadActiveLearning();
+    });
     await settings.locator('[data-panel="about"]').click();
     await settings.locator('#panel-about').waitFor({ state: 'visible' });
     assert.equal(await settings.locator('#aboutVersion').innerText(), await worker.evaluate(() => chrome.runtime.getManifest().version));
