@@ -63,3 +63,5 @@ pnpm-debug.log*
 
 # Local release archives
 /*.zip
+.narrafork/
+.worktrees/
