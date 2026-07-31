@@ -634,7 +634,6 @@ function renderTimeline(bookmarks) {
   renderQueue = [];
   renderedCount = 0;
   currentGroupLabel = '';
-  currentHighlightRanges = null;
 
   if (!bookmarks || bookmarks.length === 0) {
     timelineContent.style.display = 'none';
@@ -653,7 +652,8 @@ function renderTimeline(bookmarks) {
   const isHeatMode = sortMode === 'hottest' || sortMode === 'coldest';
 
   if (currentHighlightRanges) {
-    // 搜索模式：扁平展示
+    // 搜索模式：扁平展示（按相关度排序），无日期分组，无时间轴竖线
+    timelineContent.classList.add('timeline--flat');
     for (const item of bookmarks) {
       const ranges = currentHighlightRanges.get(item.id) || null;
       renderQueue.push({ type: 'item', data: item, ranges });
@@ -678,13 +678,6 @@ function renderTimeline(bookmarks) {
       return sortMode === 'newest' ? b.dateAdded - a.dateAdded : a.dateAdded - b.dateAdded;
     });
 
-    const groups = new Map();
-    for (const item of sorted) {
-      const label = getDateGroupLabel(item.dateAdded);
-      if (!groups.has(label)) groups.set(label, []);
-      groups.get(label).push(item);
-    }
-
     // 置顶分组置顶显示
     const pinnedItems = sorted.filter(i => i.pinned);
     if (pinnedItems.length > 0) {
@@ -692,11 +685,17 @@ function renderTimeline(bookmarks) {
       for (const item of pinnedItems) renderQueue.push({ type: 'item', data: item });
     }
 
+    // 日期分组只由非置顶项建立，避免置顶项的日期抢占分组顺序
+    const groups = new Map();
+    for (const item of sorted.filter(i => !i.pinned)) {
+      const label = getDateGroupLabel(item.dateAdded);
+      if (!groups.has(label)) groups.set(label, []);
+      groups.get(label).push(item);
+    }
+
     for (const [label, items] of groups) {
-      const nonPinned = items.filter(i => !i.pinned);
-      if (nonPinned.length === 0) continue;
-      renderQueue.push({ type: 'header', label, count: nonPinned.length });
-      for (const item of nonPinned) renderQueue.push({ type: 'item', data: item });
+      renderQueue.push({ type: 'header', label, count: items.length });
+      for (const item of items) renderQueue.push({ type: 'item', data: item });
     }
   }
 
@@ -711,7 +710,9 @@ function renderNextPage() {
   const end = Math.min(renderedCount + PAGE_SIZE, renderQueue.length);
   const fragment = document.createDocumentFragment();
 
-  let groupDiv = null;
+  // 跨页续接：上一页可能在某个日期分组内结束，沿用已渲染的最后一个分组容器
+  const renderedGroups = timelineContent.querySelectorAll('.date-group');
+  let groupDiv = renderedGroups.length ? renderedGroups[renderedGroups.length - 1] : null;
   for (let i = renderedCount; i < end; i++) {
     const entry = renderQueue[i];
 
@@ -2109,6 +2110,7 @@ async function applyBookmarkSnapshot(bookmarks, requestVersion, keepFilter = tru
       filterBookmarks(searchInput.value);
     } catch (innerErr) {
       console.error('filterBookmarks 失败，回退到 renderTimeline:', innerErr);
+      currentHighlightRanges = null;
       renderTimeline(allBookmarks);
     }
   }
@@ -2229,7 +2231,7 @@ async function deleteBookmark(id, url, element) {
         duplicateIds = computeDuplicates(allBookmarks);
         await collectAllTags();
         renderTagBar();
-        renderTimeline(allBookmarks);
+        filterBookmarks(searchInput.value);
       }, 200);
       showToast(i18n('deleted'), 'success');
     } else {

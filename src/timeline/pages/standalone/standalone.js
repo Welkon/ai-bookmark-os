@@ -1004,7 +1004,8 @@ function renderTimelineView(bookmarks) {
   }
 
   saTimelineView.innerHTML = '';
-  if (isHeatMode) saTimelineView.classList.add('sa-timeline--flat');
+  // 搜索结果与热度排序都是扁平列表，没有日期节点，隐藏时间轴竖线
+  if (isHeatMode || currentHighlightRanges) saTimelineView.classList.add('sa-timeline--flat');
   else saTimelineView.classList.remove('sa-timeline--flat');
   currentGroupLabel = '';
   renderNextPage();
@@ -1015,7 +1016,9 @@ function renderNextPage() {
   isLoadingMore = true;
   const end = Math.min(renderedCount + PAGE_SIZE, renderQueue.length);
   const fragment = document.createDocumentFragment();
-  let groupDiv = null;
+  // 跨页续接：上一页可能在某个日期分组内结束，沿用已渲染的最后一个分组容器
+  const renderedGroups = saTimelineView.querySelectorAll('.sa-date-group');
+  let groupDiv = renderedGroups.length ? renderedGroups[renderedGroups.length - 1] : null;
 
   for (let i = renderedCount; i < end; i++) {
     const entry = renderQueue[i];
