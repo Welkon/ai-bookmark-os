@@ -383,10 +383,12 @@ async function saveCheckerSetting(key, value) {
 async function loadRetentionDays() {
   try {
     const res = await chrome.runtime.sendMessage({ action: 'getAppSettings' });
-    const days = (res && res.settings && res.settings.tombstoneRetentionDays) || 7;
+    // 后台默认保留 30 天：通信失败或字段缺失时的回退展示值必须与之一致，
+    // 否则用户会在异常时看到错误的当前值并误保存。
+    const days = (res && res.settings && res.settings.tombstoneRetentionDays) || 30;
     retentionDaysSelect.value = String(days);
   } catch (e) {
-    retentionDaysSelect.value = '7';
+    retentionDaysSelect.value = '30';
   }
 }
 
@@ -1570,111 +1572,14 @@ async function handleExportHtml() {
   }
 }
 
+// 导入解析已抽取到 shared/import-parser.js，与 popup 共用同一实现，
+// 保证两个导入入口在文件夹结构、时间戳与 URL 白名单上行为一致。
 function parseImportedJSON(text) {
-  try {
-    const data = JSON.parse(text);
-    if (Number(data?.version) === 2 && Array.isArray(data.roots)) {
-      const items = [];
-      const folderPaths = [];
-      const rootNames = new Set(['书签栏', '收藏夹栏', '书签菜单', '其他书签', '其他收藏夹', '移动设备书签', 'bookmarks bar', 'bookmarks menu', 'other bookmarks', 'mobile bookmarks']);
-      const walk = (nodes, path = '') => {
-        for (const node of nodes || []) {
-          if (!node || typeof node !== 'object') continue;
-          if (node.type === 'folder') {
-            const title = String(node.title || '').trim();
-            const nextPath = !path && rootNames.has(title.toLowerCase()) ? '' : [path, title].filter(Boolean).join('/');
-            if (nextPath) folderPaths.push(nextPath);
-            walk(node.children, nextPath);
-          } else if (node.type === 'bookmark' && node.url) {
-            const metadata = node.metadata && typeof node.metadata === 'object' ? node.metadata : {};
-            items.push({
-              ...metadata,
-              title: node.title || node.url,
-              url: node.url,
-              dateAdded: node.dateAdded || Date.now(),
-              folderPath: node.folderPath || path,
-              tags: Array.isArray(metadata.tags) ? metadata.tags : [],
-              pinned: !!metadata.pinned,
-            });
-          }
-        }
-      };
-      walk(data.roots);
-      return { items, folderPaths: [...new Set(folderPaths)] };
-    }
-    const list = Array.isArray(data) ? data : (data.bookmarks || []);
-    const items = list.filter(b => b && b.url).map(b => ({
-      title: b.title || b.url,
-      url: b.url,
-      dateAdded: b.dateAdded || Date.now(),
-      folderPath: b.folderPath || '',
-      tags: Array.isArray(b.tags) ? b.tags : [],
-      pinned: !!b.pinned,
-    }));
-    return { items, folderPaths: [...new Set(items.map((item) => item.folderPath).filter(Boolean))] };
-  } catch (e) { return null; }
+  return window.ImportParser.parseImportedJSON(text);
 }
 
 function parseImportedHTML(text) {
-  const documentNode = new DOMParser().parseFromString(text, 'text/html');
-  const items = [];
-  const folderPaths = [];
-  const rootNames = new Set(['书签栏', '收藏夹栏', '书签菜单', '其他书签', '其他收藏夹', '移动设备书签', 'bookmarks bar', 'bookmarks menu', 'other bookmarks', 'mobile bookmarks']);
-  const timestamp = (value) => {
-    const parsed = Number(value);
-    if (!Number.isFinite(parsed) || parsed <= 0) return Date.now();
-    return parsed > 1e12 ? parsed : parsed * 1000;
-  };
-  const safeUrl = (value) => {
-    try {
-      const url = new URL(value);
-      return /^(https?|ftp):$/.test(url.protocol) ? url.toString() : '';
-    } catch { return ''; }
-  };
-  const directChild = (element, tagName) => [...element.children].find((child) => child.tagName === tagName) || null;
-  const walkList = (list, path = '') => {
-    const children = [...list.children];
-    for (let index = 0; index < children.length; index++) {
-      const child = children[index];
-      if (child.tagName === 'DL') {
-        walkList(child, path);
-        continue;
-      }
-      if (child.tagName !== 'DT') continue;
-      const heading = directChild(child, 'H3');
-      const anchor = directChild(child, 'A');
-      if (heading) {
-        const title = heading.textContent.trim();
-        const nextPath = !path && rootNames.has(title.toLowerCase()) ? '' : [path, title].filter(Boolean).join('/');
-        if (nextPath) folderPaths.push(nextPath);
-        let nested = directChild(child, 'DL');
-        if (!nested && children[index + 1]?.tagName === 'DL') nested = children[++index];
-        if (nested) walkList(nested, nextPath);
-        continue;
-      }
-      if (anchor) {
-        const url = safeUrl(anchor.getAttribute('href') || '');
-        if (!url) continue;
-        items.push({
-          title: anchor.textContent.trim() || url,
-          url,
-          dateAdded: timestamp(anchor.getAttribute('add_date')),
-          folderPath: path,
-          tags: String(anchor.getAttribute('tags') || '').split(',').map((tag) => tag.trim()).filter(Boolean),
-          pinned: false,
-        });
-      }
-    }
-  };
-  const rootList = documentNode.querySelector('dl');
-  if (rootList) walkList(rootList);
-  if (!items.length) {
-    for (const anchor of documentNode.querySelectorAll('a[href]')) {
-      const url = safeUrl(anchor.getAttribute('href') || '');
-      if (url) items.push({ title: anchor.textContent.trim() || url, url, dateAdded: timestamp(anchor.getAttribute('add_date')), folderPath: '', tags: [], pinned: false });
-    }
-  }
-  return { items, folderPaths: [...new Set(folderPaths)] };
+  return window.ImportParser.parseImportedHTML(text);
 }
 
 async function handleImportFile(file) {
@@ -3454,6 +3359,13 @@ async function applyReevaluationItem(item) {
   let moved = false;
   try {
     if (folderChanged) {
+      // 本次移动由"应用建议"触发，学习反馈由下方 submitBookmarkRecommendationFeedback
+      // 统一产生；先标记程序性移动，避免后台的"手工移动自动学习"再记一条重复反馈。
+      await chrome.runtime.sendMessage({
+        action: 'markProgrammaticMove',
+        bookmarkId: item.id,
+        parentId: folderId,
+      }).catch(() => null);
       await chrome.bookmarks.move(item.id, { parentId: folderId });
       moved = true;
     }
@@ -3484,6 +3396,11 @@ async function applyReevaluationItem(item) {
     return { success: true };
   } catch (error) {
     if (moved && item.parentId) {
+      await chrome.runtime.sendMessage({
+        action: 'markProgrammaticMove',
+        bookmarkId: item.id,
+        parentId: item.parentId,
+      }).catch(() => null);
       await chrome.bookmarks.move(item.id, { parentId: item.parentId }).catch(() => null);
     }
     return { success: false, reason: error?.message || 'apply_failed' };
@@ -3944,8 +3861,27 @@ async function onResolveRecommendationReview(reviewId, decision) {
   if (!reviewId || !decision) return;
   if (decision === 'accept' && !confirm('确认采用此项并用于后续推荐学习吗？')) return;
   const result = await resolveRecommendationReview(reviewId, decision);
-  showToast(result?.success ? '待复核项已处理' : `处理失败：${result?.error || 'unknown'}`, result?.success ? 'success' : 'error');
+  if (result?.success) {
+    showToast(
+      result.staleDiscarded
+        ? (i18n('reviewStaleDiscarded') || '书签已变动，过期建议已自动移除')
+        : '待复核项已处理',
+      'success',
+    );
+  } else {
+    showToast(`处理失败：${recommendationResolveErrorText(result?.error)}`, 'error');
+  }
   await loadActiveLearning();
+}
+
+function recommendationResolveErrorText(error) {
+  const map = {
+    review_item_not_found: i18n('reviewItemMissing') || '该项已被处理或移除',
+    recommendation_not_found: i18n('reviewStaleDiscarded') || '建议数据已过期，请刷新列表',
+    invalid_review_resolution: '操作无效',
+    missing_operation_id: '操作无效',
+  };
+  return map[error] || error || 'unknown';
 }
 
 function resolveRecommendationReview(reviewId, decision) {

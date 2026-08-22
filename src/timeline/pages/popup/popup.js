@@ -349,7 +349,8 @@ function getDateGroupLabel(timestamp) {
   const date = new Date(timestamp);
   const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
   const target = new Date(date.getFullYear(), date.getMonth(), date.getDate());
-  const diffDays = Math.floor((today - target) / (1000 * 60 * 60 * 24));
+  // 两个本地午夜差在夏令时切换日是 23h/25h：floor 会把“昨天”误判为“今天”，用 round。
+  const diffDays = Math.round((today - target) / (1000 * 60 * 60 * 24));
 
   if (diffDays === 0) return i18n('today');
   if (diffDays === 1) return i18n('yesterday');
@@ -2201,10 +2202,8 @@ async function handleQuickBookmarkClick() {
       window.close();
       return;
     }
-    if (result?.duplicated) {
-      showToast(i18n('quickBookmarkDuplicated') || '该页面已经在书签中', 'info');
-      return;
-    }
+    // 后台 quickBookmark 只返回 {success,pending,draft} 或 {success:false,error}；
+    // 重复收藏的提示由页面内确认面板呈现，不再依赖不存在的 duplicated 字段。
     showToast(result?.error ? `${i18n('quickBookmarkSuggestFailed') || '收藏建议失败'}：${formatQuickBookmarkError(result.error)}` : (i18n('quickBookmarkFailed') || '无法为当前页面创建收藏建议'), 'error');
   } catch (err) {
     console.error('快捷收藏失败:', err);
@@ -2569,56 +2568,53 @@ function downloadFile(filename, content, mime) {
   setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 100);
 }
 
+// 导入解析统一走 shared/import-parser.js（与设置页同一实现）：
+// 保留文件夹结构（folderPath）与原始时间戳，URL 白名单也与后台一致。
 function parseImportedHTML(text) {
-  const results = [];
-  const re = /<a[^>]*href=["']([^"']+)["'][^>]*>([^<]*)<\/a>/gi;
-  let m;
-  while ((m = re.exec(text)) !== null) {
-    const url = m[1];
-    const title = m[2] || url;
-    if (!url || url.startsWith('javascript:') || url.startsWith('data:')) continue;
-    results.push({
-      id: 'imp_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8),
-      title, url,
-      domain: extractDomain(url),
-      dateAdded: Date.now(),
-      tags: [], pinned: false
-    });
-  }
-  return results;
+  const parsed = window.ImportParser.parseImportedHTML(text);
+  return parsed ? parsed.items : null;
 }
 
 function parseImportedJSON(text) {
-  try {
-    const data = JSON.parse(text);
-    const list = Array.isArray(data) ? data : (data.bookmarks || []);
-    return list.filter(b => b && b.url).map(b => ({
-      id: 'imp_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8),
-      title: b.title || b.url,
-      url: b.url,
-      domain: extractDomain(b.url),
-      dateAdded: b.dateAdded || Date.now(),
-      tags: Array.isArray(b.tags) ? b.tags : [],
-      pinned: !!b.pinned
-    }));
-  } catch (e) {
-    return null;
-  }
+  const parsed = window.ImportParser.parseImportedJSON(text);
+  return parsed ? parsed.items : null;
 }
 
 function handleImportFile(file) {
   const reader = new FileReader();
   reader.onload = async (e) => {
     const text = e.target.result;
-    let items = null;
-    if (file.name.endsWith('.json')) items = parseImportedJSON(text);
-    else items = parseImportedHTML(text);
-    if (!items || items.length === 0) { showToast(i18n('importEmpty'), 'error'); return; }
+    let parsed = null;
+    if (file.name.endsWith('.json')) parsed = window.ImportParser.parseImportedJSON(text);
+    else parsed = window.ImportParser.parseImportedHTML(text);
+    if (!parsed || (parsed.items.length === 0 && parsed.folderPaths.length === 0)) { showToast(i18n('importEmpty'), 'error'); return; }
+    const items = parsed.items;
+    // 与后台 normalizeUrl 的白名单对齐（仅 http/https/ftp）：
+    // 否则 about:/place: 等条目会让整次导入返回 success:false，但书签其实已大部分创建。
+    const importable = items.filter((item) => /^(https?|ftp):/i.test(item.url));
+    const rejected = items.length - importable.length;
+    if (importable.length === 0) { showToast(i18n('importEmpty'), 'error'); return; }
     try {
-      const result = await chrome.runtime.sendMessage({ action: 'importData', bookmarks: items, mode: 'merge' });
-      if (result?.success) {
-        showToast(i18n('importedCount', [String(result.added)]), 'success');
+      const result = await chrome.runtime.sendMessage({
+        action: 'importData',
+        bookmarks: importable,
+        folderPaths: parsed.folderPaths,
+        duplicateStrategy: 'merge',
+      });
+      if (result?.success || result?.status === 'partial') {
+        // 部分成功也要反馈：静默会让用户以为导入没生效而反复重试，产生重复数据。
+        const created = result.created?.length || 0;
+        const merged = result.merged?.length || 0;
+        const skipped = (result.skipped?.length || 0) + rejected;
+        const failed = (result.invalid?.length || 0) + (result.failed?.length || 0);
+        const isZh = typeof _currentLang !== 'undefined' && _currentLang === 'zh_CN';
+        const summary = isZh
+          ? `导入完成：新增 ${created}，合并 ${merged}，跳过 ${skipped}，失败 ${failed}`
+          : `Imported: created ${created}, merged ${merged}, skipped ${skipped}, failed ${failed}`;
+        showToast(summary, result?.status === 'partial' ? 'warning' : 'success');
         await loadBookmarks();
+      } else {
+        showToast(i18n('importFailed'), 'error');
       }
     } catch (err) { console.error(err); showToast(i18n('importFailed'), 'error'); }
   };

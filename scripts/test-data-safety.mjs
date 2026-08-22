@@ -129,10 +129,21 @@ assert.match(backgroundSource, /operation\.failed\.length \|\| operation\.invali
 assert.match(backgroundSource, /message\.requestId,[\s\S]{0,160}retryImportOperation\(message\.operationId\)/);
 
 const settingsSource = readFileSync('src/timeline/pages/settings/settings.js', 'utf8');
-assert.match(settingsSource, /version:\s*2,[\s\S]{0,120}roots:/);
+assert.match(settingsSource, /version:\s*2,[\s\S]{0,120}roots:/, 'export bundle must stay versioned with roots');
 assert.match(settingsSource, /<!DOCTYPE NETSCAPE-Bookmark-file-1>/);
-assert.match(settingsSource, /new DOMParser\(\)\.parseFromString\(text, 'text\/html'\)/);
-assert.match(settingsSource, /node\.type === 'folder'/);
 assert.doesNotMatch(settingsSource, /function buildBookmarksPage\(/);
+
+// 导入解析已抽取到 shared/import-parser.js（popup 与 settings 共用同一实现）。
+// 两个入口必须委托共享解析器，避免各自维护一份行为不一致的解析逻辑。
+const importParserSource = readFileSync('src/timeline/shared/import-parser.js', 'utf8');
+assert.match(importParserSource, /new DOMParser\(\)\.parseFromString\(text, 'text\/html'\)/);
+assert.match(importParserSource, /node\.type === 'folder'/);
+assert.match(importParserSource, /Number\(data\?\.version\) === 2 && Array\.isArray\(data\.roots\)/);
+assert.match(importParserSource, /\^\(https\?\|ftp\):\$/);
+assert.match(settingsSource, /window\.ImportParser\.parseImportedHTML/);
+assert.match(settingsSource, /window\.ImportParser\.parseImportedJSON/);
+const popupSource = readFileSync('src/timeline/pages/popup/popup.js', 'utf8');
+assert.match(popupSource, /window\.ImportParser\.parseImportedHTML/);
+assert.match(popupSource, /folderPaths: parsed\.folderPaths/, 'popup 导入必须随书签传递文件夹结构');
 
 console.log('data safety regression checks passed');

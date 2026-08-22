@@ -405,8 +405,12 @@ export function BookmarkNavPage() {
   const activeMetaWorkers = useRef(0);
   const metaLoaderMounted = useRef(true);
   const bookmarkRefreshTimer = useRef<number | null>(null);
+  const loadRequestRef = useRef(0);
 
   const loadBookmarks = useCallback(async () => {
+    // 请求序号防乱序：手动刷新与书签事件防抖可能并发触发加载，
+    // 较慢的旧响应后返回时不允许覆盖新状态。
+    const requestId = ++loadRequestRef.current;
     setStatus('loading');
     setError('');
 
@@ -432,7 +436,9 @@ export function BookmarkNavPage() {
         getTimelineTags(),
         getSharedTagColors(),
       ]);
+      if (requestId !== loadRequestRef.current) return;
       const tree = await chrome.bookmarks.getTree();
+      if (requestId !== loadRequestRef.current) return;
       const nextFolderTree = buildFolderTree(tree);
       setBookmarks(items.sort((a, b) => a.title.localeCompare(b.title, 'zh-CN')));
       setFolderTree(nextFolderTree);
@@ -441,6 +447,8 @@ export function BookmarkNavPage() {
       setLabelCache(storage.labelCache ?? {});
       setTimelineTags(tagsById);
       setTagColors(sharedTagColors);
+      // 新一轮加载开始时复位“摘要暂不可用”：网络恢复后刷新不应残留旧横幅。
+      setMetaUnavailable(false);
       setExpandedFolderIds((current) => {
         const valid = new Set<string>();
         const collect = (nodes: BookmarkFolderNode[]) => {
@@ -456,6 +464,7 @@ export function BookmarkNavPage() {
       });
       setStatus(items.length ? 'ready' : 'empty');
     } catch (err) {
+      if (requestId !== loadRequestRef.current) return;
       setStatus('error');
       setError((err as Error).message || '读取书签失败，请稍后重试。');
     }
@@ -470,10 +479,21 @@ export function BookmarkNavPage() {
   }, [classifyResult, labelCache]);
 
   const getBookmarkTags = useCallback((bookmark: FlatBookmark): string[] => {
-    if (!isDemo) return timelineTags[bookmark.id] ?? [];
-    const demoTags = visibleTags((bookmark as FlatBookmark & { tags?: unknown }).tags);
+    if (!isDemo) {
+      // 时间线标签优先，其次 AI 分类结果/标签缓存里的 tags：
+      // 否则时间线无数据时卡片可能一个标签都没有。
+      const fromTimeline = visibleTags(timelineTags[bookmark.id]);
+      if (fromTimeline.length) return fromTimeline;
+      const labelTags = visibleTags(classifyResult?.labels?.[bookmark.id]?.tags)
+        .concat(visibleTags(labelCache[hashUrl(bookmark.url)]?.tags));
+      return [...new Set(labelTags)].slice(0, 3);
+    }
+    // 演示书签的 tags 在导出时被剥离，真实标签保存在 DEMO_CLASSIFY_RESULT.labels：
+    // 从分类结果读取，避免展示纯正则猜测的标签。
+    const demoLabel = classifyResult?.labels?.[bookmark.id];
+    const demoTags = visibleTags(demoLabel?.tags);
     return demoTags.length ? demoTags : inferTags(bookmark);
-  }, [isDemo, timelineTags]);
+  }, [isDemo, timelineTags, classifyResult, labelCache]);
 
   const drainMetaQueue = useCallback(function drain(): void {
     while (metaLoaderMounted.current && activeMetaWorkers.current < 3 && metaQueue.current.length > 0) {

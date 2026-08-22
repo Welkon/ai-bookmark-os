@@ -64,11 +64,13 @@ assert.deepEqual(barChildren, ['A', 'B', 'C'], 'restored sibling folders must ke
 const partialStorage = {};
 const workChildren = ['A', 'B', 'U', 'source'];
 const folderChildren = new Map([
+  ['0', ['bar']],
   ['bar', ['work']],
   ['work', workChildren],
   ['source', ['C']],
 ]);
 const nodes = new Map([
+  ['0', { id: '0', title: 'Root' }],
   ['bar', { id: 'bar', title: 'Bookmarks Bar', parentId: '0' }],
   ['work', { id: 'work', title: 'Work', parentId: 'bar' }],
   ['A', { id: 'A', title: 'A', url: 'https://example.com/a', parentId: 'work' }],
@@ -103,6 +105,7 @@ globalThis.chrome = {
   bookmarks: {
     get: async (id) => [readNode(id)],
     getSubTree: async (id) => [readSubTree(id)],
+    getTree: async () => [readSubTree('0')],
     create: async ({ parentId, title }) => {
       createCount++;
       if (createCount === 2) throw new Error('injected create failure');

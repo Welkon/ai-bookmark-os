@@ -26,6 +26,27 @@ const APPLY_RECORD_KEY = 'applyRecord';
 const PARTIAL_APPLY_RECORDS_KEY = 'partialApplyRecords';
 const FULL_REPLACEMENT_TRANSACTION_KEY = 'fullReplacementTransaction';
 
+// 应用/撤销会批量移动书签，这些是程序性移动而非用户手工归档；后台会把未标记的
+// 移动当作手工归档自动学习（domain→folder 规则）。因此批量操作期间需通知后台
+// 暂停"移动学习"，结束后恢复。计数支持嵌套；旧后台/测试桩无 runtime 时静默跳过。
+let moveLearningPauseDepth = 0;
+
+async function pauseMoveLearning(): Promise<void> {
+  moveLearningPauseDepth += 1;
+  if (moveLearningPauseDepth > 1) return;
+  try {
+    await chrome.runtime?.sendMessage?.({ action: 'setMoveLearningSuppression', active: true });
+  } catch { /* 消息不可达时不影响应用流程 */ }
+}
+
+async function resumeMoveLearning(): Promise<void> {
+  moveLearningPauseDepth = Math.max(0, moveLearningPauseDepth - 1);
+  if (moveLearningPauseDepth > 0) return;
+  try {
+    await chrome.runtime?.sendMessage?.({ action: 'setMoveLearningSuppression', active: false });
+  } catch { /* 同上 */ }
+}
+
 type FullReplacementPhase = 'staging' | 'swapping' | 'rollback-pending' | 'committed';
 
 /**
@@ -54,12 +75,7 @@ type PartialApplyRecord = ApplyRecord & {
   createdFolderIds: string[];
   status: 'applying' | 'complete' | 'rollback-pending';
 };
-/* Legacy corrupted text retained only to avoid a source-encoding rewrite. It is not executed.
-const BROWSER_BOOKMARK_ROOT_TITLES = new Set([
-  '涔︾鏍?, '鍏朵粬涔︾', '绉诲姩璁惧涔︾',
-  'Bookmarks bar', 'Other bookmarks', 'Mobile bookmarks',
-]);
-*/
+// 根目录标题用 fromCharCode 写出，避免源文件编码再次损坏（历史上出过一次乱码事故）。
 const BROWSER_BOOKMARK_ROOT_TITLES = new Set([
   String.fromCharCode(0x4e66, 0x7b7e, 0x680f),
   String.fromCharCode(0x5176, 0x4ed6, 0x4e66, 0x7b7e),
@@ -345,6 +361,23 @@ function isBookmarkNode(node: chrome.bookmarks.BookmarkTreeNode | undefined): bo
   return typeof node?.url === 'string';
 }
 
+/**
+ * 一次 getTree 建立 id → 节点索引。full apply 的预检与 moves 记录此前对每个
+ * 书签调一次 chrome.bookmarks.get（>5000 书签即数千次往返）；改成单次取树后
+ * 内存查找。注意：partial 范围禁止读取全树（设计不变量），本索引只用于 full 路径。
+ */
+async function buildBookmarkNodeIndex(): Promise<Map<string, chrome.bookmarks.BookmarkTreeNode>> {
+  const index = new Map<string, chrome.bookmarks.BookmarkTreeNode>();
+  const walk = (nodes: chrome.bookmarks.BookmarkTreeNode[]) => {
+    for (const node of nodes) {
+      index.set(node.id, node);
+      if (node.children) walk(node.children);
+    }
+  };
+  walk(await chrome.bookmarks.getTree());
+  return index;
+}
+
 const FULL_PLAN_CHANGED_ERROR = '分类方案中的书签已变化，请基于当前书签重新生成全量分类方案。';
 const PARTIAL_PLAN_CHANGED_ERROR = '所选目录中的书签已变化，请重新执行分类。';
 export interface ClassificationApplySource {
@@ -374,13 +407,23 @@ async function assertClassificationSourceCurrent(
 }
 
 async function assertFullPlannedBookmarksExist(bookmarkIds: string[]): Promise<void> {
+  // 空方案不触发任何书签 API：无 id 需要校验（也保持“存在撤销记录时先拒绝”
+  // 的检查顺序不被树读取抢先）。
+  if (bookmarkIds.length === 0) return;
+  // 单次取树替代逐书签 get：语义等价（id 存在且为书签节点），往返从 N 次降为 1 次。
+  // 索引未命中时回退到单条 get——Chrome 真实 getTree 总是完整树，正常不会走到；
+  // 该兜底保证与旧实现逐条 get 的语义在任何环境下完全一致。
+  const index = await buildBookmarkNodeIndex();
   for (const id of bookmarkIds) {
-    try {
-      const [node] = await chrome.bookmarks.get(id);
-      if (!isBookmarkNode(node)) throw new Error('invalid planned bookmark');
-    } catch {
-      throw new Error(FULL_PLAN_CHANGED_ERROR);
+    let node = index.get(id);
+    if (!node) {
+      try {
+        [node] = await chrome.bookmarks.get(id);
+      } catch {
+        node = undefined;
+      }
     }
+    if (!isBookmarkNode(node)) throw new Error(FULL_PLAN_CHANGED_ERROR);
   }
 }
 
@@ -388,6 +431,8 @@ async function assertPartialPlannedBookmarksInScope(
   bookmarkIds: string[],
   targetDirectoryId: string,
 ): Promise<void> {
+  // 刻意不做全树索引：partial 范围禁止读取整棵书签树（既有设计不变量，有测试守护），
+  // 且目标目录内 id 数量有限，逐条 get 的成本可控。
   for (const id of bookmarkIds) {
     try {
       const [node] = await chrome.bookmarks.get(id);
@@ -463,7 +508,7 @@ export async function inspectClassificationPlanCompatibility(
  * 在书签栏下创建「✨ AI 整理」根文件夹，按树结构建文件夹并移动书签。
  * 调用前必须先 backupBookmarks()。同时记录每条书签原位置供撤销。
  */
-export async function applyToBookmarks(
+async function applyToBookmarksInternal(
   tree: CategoryNode[],
   onProgress?: (done: number, total: number) => void,
   onComplete?: (result: ApplyResult) => void,
@@ -542,16 +587,20 @@ async function applyFirstFullClassification(
   const recoverableIds = new Set<string>();
   const bookmarkIds = collectPlannedBookmarkIds(tree);
 
+  // moves 记录复用一次树索引（此前逐书签一次 get，数千书签即数千次往返）。
+  // 索引未命中时回退单条 get，语义与旧实现一致。
+  const nodeIndex = await buildBookmarkNodeIndex();
   for (const id of bookmarkIds) {
     try {
-      const [node] = await chrome.bookmarks.get(id);
+      let node = nodeIndex.get(id);
+      if (!node) [node] = await chrome.bookmarks.get(id);
       if (!isBookmarkNode(node)) throw new Error('invalid planned bookmark');
       record.moves.push({
         id,
-        oldParentId: node.parentId ?? bar.id,
-        oldIndex: node.index ?? 0,
+        oldParentId: node!.parentId ?? bar.id,
+        oldIndex: node!.index ?? 0,
       });
-      sourceFoldersByBookmark.set(id, await collectSourceFolders(node.parentId));
+      sourceFoldersByBookmark.set(id, await collectSourceFolders(node!.parentId));
       recoverableIds.add(id);
     } catch {
       try {
@@ -1519,7 +1568,7 @@ async function rollbackPartialApply(
  * 严格在一个目录内部应用分类。
  * 写入前重新读取目标子树，避免过期或范围外的 ID 被移动。
  */
-export async function applyPartialToBookmarks(
+async function applyPartialToBookmarksInternal(
   tree: CategoryNode[],
   targetDirectoryId: string,
   onProgress?: (done: number, total: number) => void,
@@ -1830,7 +1879,7 @@ async function undoFullApply(
 /**
  * 保持原全量撤销接口：存在局部操作时必须先按最近一次局部操作撤销。
  */
-export async function undoApply(
+async function undoApplyInternal(
   onProgress?: (done: number, total: number) => void,
 ): Promise<number> {
   await recoverPendingFullReplacement();
@@ -1846,7 +1895,7 @@ export async function undoApply(
 }
 
 /** 撤销用户最后一次应用；局部操作优先于全量操作。 */
-export async function undoLatestApply(
+async function undoLatestApplyInternal(
   onProgress?: (done: number, total: number) => void,
 ): Promise<number> {
   await recoverPendingFullReplacement();
@@ -1856,4 +1905,56 @@ export async function undoLatestApply(
     return undoPartialApplyRecord(record, partialRecords, onProgress);
   }
   return undoApply(onProgress);
+}
+
+// 以下导出包装：应用/撤销的批量书签移动属于程序性移动，期间暂停后台的
+// "手工移动自动学习"，防止把分类器自身的输出误学为用户归档意图。
+export async function applyToBookmarks(
+  tree: CategoryNode[],
+  onProgress?: (done: number, total: number) => void,
+  onComplete?: (result: ApplyResult) => void,
+  source?: ClassificationApplySource,
+): Promise<void> {
+  await pauseMoveLearning();
+  try {
+    return await applyToBookmarksInternal(tree, onProgress, onComplete, source);
+  } finally {
+    await resumeMoveLearning();
+  }
+}
+
+export async function applyPartialToBookmarks(
+  tree: CategoryNode[],
+  targetDirectoryId: string,
+  onProgress?: (done: number, total: number) => void,
+  source?: ClassificationApplySource,
+): Promise<ApplyResult & { title: string }> {
+  await pauseMoveLearning();
+  try {
+    return await applyPartialToBookmarksInternal(tree, targetDirectoryId, onProgress, source);
+  } finally {
+    await resumeMoveLearning();
+  }
+}
+
+export async function undoApply(
+  onProgress?: (done: number, total: number) => void,
+): Promise<number> {
+  await pauseMoveLearning();
+  try {
+    return await undoApplyInternal(onProgress);
+  } finally {
+    await resumeMoveLearning();
+  }
+}
+
+export async function undoLatestApply(
+  onProgress?: (done: number, total: number) => void,
+): Promise<number> {
+  await pauseMoveLearning();
+  try {
+    return await undoLatestApplyInternal(onProgress);
+  } finally {
+    await resumeMoveLearning();
+  }
 }

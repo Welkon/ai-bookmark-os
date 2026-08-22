@@ -360,7 +360,8 @@ const SIGNAL_WEIGHTS = {
   prototypeBm25: 14,
 
   // 图推理层（异步场景）
-  temporalCluster: 12,
+  temporalCluster: 12,
+
   // AI 增强层
   ai: 45,
 
@@ -946,6 +947,19 @@ let _totalDocsCache = 0;
 let _totalTokenLenCache = 0;
 let _processedDocUrlsCache = null;
 
+// ===== 存储读改写串行化 =====
+// 本模块的语料/队列/规则/统计更新都是 load→改→save 模式，同一上下文内并发调用
+// （批量打标、导入回填、书签事件同时触发）会交错执行丢更新。按 key 维护
+// Promise 链保证同一份状态上的变更顺序执行。
+const _storageMutationChains = new Map();
+function runSerializedMutation(key, task) {
+  const previous = _storageMutationChains.get(key) || Promise.resolve();
+  const run = previous.then(task, task);
+  // 链上吞掉错误：一次失败不能让同 key 后续更新全部短路；调用方自行感知结果。
+  _storageMutationChains.set(key, run.then(() => undefined, () => undefined));
+  return run;
+}
+
 async function loadDocFrequency() {
   if (_docFreqCache) return { df: _docFreqCache, totalDocs: _totalDocsCache, totalTokenLen: _totalTokenLenCache };
   try {
@@ -980,29 +994,31 @@ async function saveProcessedDocUrls(set) {
 }
 
 // 增量更新文档频率（新书签入库时调用）
-async function updateDocFrequency(text, url = null) {
-  // URL 级去重：同一文档只统计一次 df
-  if (url) {
-    const processed = await loadProcessedDocUrls();
-    const key = url.toLowerCase().trim();
-    if (processed.has(key)) return;
-    processed.add(key);
-    await saveProcessedDocUrls(processed);
-  }
+function updateDocFrequency(text, url = null) {
+  return runSerializedMutation('doc-freq', async () => {
+    // URL 级去重：同一文档只统计一次 df
+    if (url) {
+      const processed = await loadProcessedDocUrls();
+      const key = url.toLowerCase().trim();
+      if (processed.has(key)) return;
+      processed.add(key);
+      await saveProcessedDocUrls(processed);
+    }
 
-  const tokens = tokenize(text);
-  const tokenSet = new Set(tokens); // 去重：每篇文档每个词只计一次
-  const { df, totalDocs, totalTokenLen } = await loadDocFrequency();
+    const tokens = tokenize(text);
+    const tokenSet = new Set(tokens); // 去重：每篇文档每个词只计一次
+    const { df, totalDocs, totalTokenLen } = await loadDocFrequency();
 
-  for (const token of tokenSet) {
-    df[token] = (df[token] || 0) + 1;
-  }
-  _docFreqCache = df;
-  _totalDocsCache = totalDocs + 1;
-  _totalTokenLenCache = totalTokenLen + tokens.length;
+    for (const token of tokenSet) {
+      df[token] = (df[token] || 0) + 1;
+    }
+    _docFreqCache = df;
+    _totalDocsCache = totalDocs + 1;
+    _totalTokenLenCache = totalTokenLen + tokens.length;
 
-  await chrome.storage.local.set({
-    [DOC_FREQ_KEY]: { df, totalDocs: _totalDocsCache, totalTokenLen: _totalTokenLenCache }
+      await chrome.storage.local.set({
+        [DOC_FREQ_KEY]: { df, totalDocs: _totalDocsCache, totalTokenLen: _totalTokenLenCache }
+      });
   });
 }
 
@@ -1181,38 +1197,40 @@ async function loadTagCorpus() {
 }
 
 // 增量更新标签语料（书签打标签后调用）
-async function updateTagCorpus(text, tags) {
-  if (!tags || tags.length === 0) return;
-  const corpus = await loadTagCorpus();
-  const tokens = tokenize(text);
-  const tokenFreq = new Map();
-  for (const t of tokens) {
-    tokenFreq.set(t, (tokenFreq.get(t) || 0) + 1);
-  }
-
-  // 全局词汇表更新
-  const globalVocabSet = new Set(Object.keys(corpus.tagFreq).length > 0
-    ? collectAllVocab(corpus) : []);
-  for (const token of tokenFreq.keys()) {
-    globalVocabSet.add(token);
-  }
-  corpus.globalVocabSize = globalVocabSet.size;
-
-  // 为每个标签更新词频
-  for (const tag of tags) {
-    if (!corpus.tagFreq[tag]) {
-      corpus.tagFreq[tag] = {};
-      corpus.tagTotalWords[tag] = 0;
+function updateTagCorpus(text, tags) {
+  return runSerializedMutation('tag-corpus', async () => {
+    if (!tags || tags.length === 0) return;
+    const corpus = await loadTagCorpus();
+    const tokens = tokenize(text);
+    const tokenFreq = new Map();
+    for (const t of tokens) {
+      tokenFreq.set(t, (tokenFreq.get(t) || 0) + 1);
     }
-    const freq = corpus.tagFreq[tag];
-    for (const [token, count] of tokenFreq) {
-      freq[token] = (freq[token] || 0) + count;
-      corpus.tagTotalWords[tag] += count;
-    }
-  }
 
-  _tagCorpusCache = corpus;
-  await chrome.storage.local.set({ [TAG_CORPUS_KEY]: corpus });
+    // 全局词汇表更新
+    const globalVocabSet = new Set(Object.keys(corpus.tagFreq).length > 0
+      ? collectAllVocab(corpus) : []);
+    for (const token of tokenFreq.keys()) {
+      globalVocabSet.add(token);
+    }
+    corpus.globalVocabSize = globalVocabSet.size;
+
+    // 为每个标签更新词频
+    for (const tag of tags) {
+      if (!corpus.tagFreq[tag]) {
+        corpus.tagFreq[tag] = {};
+        corpus.tagTotalWords[tag] = 0;
+      }
+      const freq = corpus.tagFreq[tag];
+      for (const [token, count] of tokenFreq) {
+        freq[token] = (freq[token] || 0) + count;
+        corpus.tagTotalWords[tag] += count;
+      }
+    }
+
+    _tagCorpusCache = corpus;
+    await chrome.storage.local.set({ [TAG_CORPUS_KEY]: corpus });
+  });
 }
 
 // 收集语料中所有词汇（用于全局词汇表大小）
@@ -1851,50 +1869,63 @@ async function getUserOverrides() {
 }
 
 // ===== 记录用户覆盖 =====
-async function recordUserOverride(domain, autoTag, userTag) {
-  const overrides = await getUserOverrides();
-  const existing = overrides.findIndex(o => o.domain === domain && o.autoTag === autoTag);
+function recordUserOverride(domain, autoTag, userTag) {
+  return runSerializedMutation('user-overrides', async () => {
+    const overrides = await getUserOverrides();
+    const existing = overrides.findIndex(o => o.domain === domain && o.autoTag === autoTag);
 
-  if (existing >= 0) {
-    overrides[existing].userTag = userTag;
-  } else {
-    overrides.push({ domain, autoTag, userTag });
-  }
-
-  _userOverridesCache = overrides;
-  await chrome.storage.local.set({ [USER_OVERRIDES_KEY]: overrides });
-}
-
-// ===== 保存标签颜色 =====
-async function saveTagColor(tag, color) {
-  const result = await chrome.storage.local.get(TAG_COLORS_KEY);
-  const colors = result[TAG_COLORS_KEY] || {};
-  colors[tag] = color;
-  await chrome.storage.local.set({ [TAG_COLORS_KEY]: colors });
-}
-
-// ===== 获取标签颜色 =====
-async function getTagColor(tag) {
-  // 先从存储中获取
-  const result = await chrome.storage.local.get(TAG_COLORS_KEY);
-  const colors = result[TAG_COLORS_KEY] || {};
-
-  if (colors[tag]) return colors[tag];
-
-  // 从域名规则中查找
-  for (const rule of DOMAIN_RULES) {
-    if (rule.tag === tag) {
-      await saveTagColor(tag, rule.color);
-      return rule.color;
+    if (existing >= 0) {
+      overrides[existing].userTag = userTag;
+    } else {
+      overrides.push({ domain, autoTag, userTag });
     }
-  }
 
-  // 生成默认颜色
+    _userOverridesCache = overrides;
+    await chrome.storage.local.set({ [USER_OVERRIDES_KEY]: overrides });
+  });
+}
+
+// ===== 标签颜色 =====
+// 此前 getTagColor 每个未缓存标签都做一次 get + 一次全量 set（首屏串行 IO），
+// 且 saveTagColor 是无队列读改写，并发调用互相覆盖丢色。改为：
+// 本上下文缓存一次 + 串行批量写 + 规则色/哈希色按需计算不落盘（两者都是确定性的）。
+let _tagColorsCache = null;
+
+async function loadTagColors() {
+  if (_tagColorsCache) return _tagColorsCache;
+  try {
+    const result = await chrome.storage.local.get(TAG_COLORS_KEY);
+    _tagColorsCache = result[TAG_COLORS_KEY] || {};
+  } catch {
+    _tagColorsCache = {};
+  }
+  return _tagColorsCache;
+}
+
+async function saveTagColorsBulk(colors) {
+  const entries = Object.entries(colors || {});
+  if (entries.length === 0) return;
+  await runSerializedMutation('tag-colors', async () => {
+    const current = await loadTagColors();
+    const next = { ...current };
+    for (const [tag, color] of entries) next[tag] = color;
+    _tagColorsCache = next;
+    await chrome.storage.local.set({ [TAG_COLORS_KEY]: next });
+  });
+}
+
+async function saveTagColor(tag, color) {
+  await saveTagColorsBulk({ [tag]: color });
+}
+
+async function getTagColor(tag) {
+  const colors = await loadTagColors();
+  if (colors[tag]) return colors[tag];
+  for (const rule of DOMAIN_RULES) {
+    if (rule.tag === tag) return rule.color;
+  }
   const hash = Array.from(tag).reduce((acc, char) => acc + char.charCodeAt(0), 0);
-  const hue = hash % 360;
-  const color = `hsl(${hue}, 60%, 50%)`;
-  await saveTagColor(tag, color);
-  return color;
+  return `hsl(${hash % 360}, 60%, 50%)`;
 }
 
 // ===== 主分类函数（5 层信号融合 + 置信度评分） =====
@@ -2148,12 +2179,8 @@ async function autoTagBookmark(bookmark, options = {}) {
     signals: signals[tag] || []
   }));
 
-  // 保存颜色
-  for (const { tag } of results) {
-    if (tagColors[tag]) {
-      await saveTagColor(tag, tagColors[tag]);
-    }
-  }
+  // 保存颜色：一次批量写，替代此前的逐标签全量读改写
+  await saveTagColorsBulk(tagColors);
 
   return results;
 }
@@ -2385,12 +2412,8 @@ function autoTagBookmarkSync(bookmark) {
     signals: signals[tag] || []
   }));
 
-  // 颜色保存异步触发（不阻塞）
-  for (const { tag } of results) {
-    if (tagColors[tag]) {
-      saveTagColor(tag, tagColors[tag]); // fire-and-forget
-    }
-  }
+  // 颜色保存异步触发（不阻塞）：批量一次写
+  saveTagColorsBulk(tagColors); // fire-and-forget
 
   return results;
 }
@@ -2450,15 +2473,17 @@ function isDomainSeen(domain) {
 }
 
 // 标记域名已被见过
-async function markDomainSeen(domain) {
-  if (!domain) return;
-  const rules = await loadDynamicRules();
-  const lower = domain.toLowerCase();
-  if (!rules.seenDomains) rules.seenDomains = [];
-  if (!rules.seenDomains.includes(lower)) {
-    rules.seenDomains.push(lower);
-    await saveDynamicRules(rules);
-  }
+function markDomainSeen(domain) {
+  return runSerializedMutation('dynamic-rules', async () => {
+    if (!domain) return;
+    const rules = await loadDynamicRules();
+    const lower = domain.toLowerCase();
+    if (!rules.seenDomains) rules.seenDomains = [];
+    if (!rules.seenDomains.includes(lower)) {
+      rules.seenDomains.push(lower);
+      await saveDynamicRules(rules);
+    }
+  });
 }
 
 // 获取合并后的停用词集合（内置 + 动态）
@@ -2500,39 +2525,41 @@ function getMergedKeywordMap() {
 
 // 自动学习：当用户手动将书签移入某目录时，学习"域名→目录名(标签)"映射
 // domain: 书签域名, folderName: 目标目录名（视为标签）
-async function learnDomainTag(domain, folderName) {
-  folderName = canonicalCategoryTag(folderName);
-  if (!domain || !folderName) return;
-  const rules = await loadDynamicRules();
-  const lowerDomain = domain.toLowerCase();
+function learnDomainTag(domain, folderName) {
+  return runSerializedMutation('dynamic-rules', async () => {
+    folderName = canonicalCategoryTag(folderName);
+    if (!domain || !folderName) return;
+    const rules = await loadDynamicRules();
+    const lowerDomain = domain.toLowerCase();
 
-  // 1. 更新学习到的域名→标签映射（带计数/置信度）
-  if (!rules.learnedDomainTag) rules.learnedDomainTag = {};
-  const existing = rules.learnedDomainTag[lowerDomain];
-  if (existing && typeof existing === 'object' && existing.tag === folderName) {
-    existing.count = (existing.count || 1) + 1;
-  } else {
-    rules.learnedDomainTag[lowerDomain] = { tag: folderName, count: 1 };
-  }
-
-  // 2. 若该域名未在任何域名规则中且置信度足够，自动加入 domainRules
-  const learned = rules.learnedDomainTag[lowerDomain];
-  // 与 matchDomainTag 共用后缀语义：用 includes 会把 'notgithub.com' 误判为已在
-  // 内置规则中，导致它永不进入自动学习，而分类时又匹配不上，学习闭环断裂。
-  const inBuiltin = DOMAIN_RULES.some(r => r.domains.some(d => domainMatchesRuleDomain(lowerDomain, d)));
-  const inDynamic = (rules.domainRules || []).some(r => r.domains.some(d => domainMatchesRuleDomain(lowerDomain, d)));
-  if (!inBuiltin && !inDynamic && learned.count >= 2) {
-    if (!rules.domainRules) rules.domainRules = [];
-    const existingRule = rules.domainRules.find(r => r.tag === folderName && r.source !== 'user');
-    if (existingRule) {
-      existingRule.source = 'learned';
-      if (!existingRule.domains.includes(lowerDomain)) existingRule.domains.push(lowerDomain);
+    // 1. 更新学习到的域名→标签映射（带计数/置信度）
+    if (!rules.learnedDomainTag) rules.learnedDomainTag = {};
+    const existing = rules.learnedDomainTag[lowerDomain];
+    if (existing && typeof existing === 'object' && existing.tag === folderName) {
+      existing.count = (existing.count || 1) + 1;
     } else {
-      rules.domainRules.push({ domains: [lowerDomain], tag: folderName, color: '#607d8b', source: 'learned' });
+      rules.learnedDomainTag[lowerDomain] = { tag: folderName, count: 1 };
     }
-  }
 
-  await saveDynamicRules(rules);
+    // 2. 若该域名未在任何域名规则中且置信度足够，自动加入 domainRules
+    const learned = rules.learnedDomainTag[lowerDomain];
+    // 与 matchDomainTag 共用后缀语义：用 includes 会把 'notgithub.com' 误判为已在
+    // 内置规则中，导致它永不进入自动学习，而分类时又匹配不上，学习闭环断裂。
+    const inBuiltin = DOMAIN_RULES.some(r => r.domains.some(d => domainMatchesRuleDomain(lowerDomain, d)));
+    const inDynamic = (rules.domainRules || []).some(r => r.domains.some(d => domainMatchesRuleDomain(lowerDomain, d)));
+    if (!inBuiltin && !inDynamic && learned.count >= 2) {
+      if (!rules.domainRules) rules.domainRules = [];
+      const existingRule = rules.domainRules.find(r => r.tag === folderName && r.source !== 'user');
+      if (existingRule) {
+        existingRule.source = 'learned';
+        if (!existingRule.domains.includes(lowerDomain)) existingRule.domains.push(lowerDomain);
+      } else {
+        rules.domainRules.push({ domains: [lowerDomain], tag: folderName, color: '#607d8b', source: 'learned' });
+      }
+    }
+
+    await saveDynamicRules(rules);
+  });
 }
 
 // 供 popup 设置页调用：获取/添加/删除动态规则
@@ -2540,108 +2567,122 @@ async function getDynamicRules() {
   return await loadDynamicRules();
 }
 
-async function addDynamicDomainRule(domains, tag, color) {
-  tag = canonicalCategoryTag(tag);
-  if (!tag) throw new Error('invalid_category_tag');
-  const rules = await loadDynamicRules();
-  if (!rules.domainRules) rules.domainRules = [];
-  rules.domainRules.push({ domains, tag, color: color || '#607d8b', source: 'user' });
-  await saveDynamicRules(rules);
+function addDynamicDomainRule(domains, tag, color) {
+  return runSerializedMutation('dynamic-rules', async () => {
+    tag = canonicalCategoryTag(tag);
+    if (!tag) throw new Error('invalid_category_tag');
+    const rules = await loadDynamicRules();
+    if (!rules.domainRules) rules.domainRules = [];
+    rules.domainRules.push({ domains, tag, color: color || '#607d8b', source: 'user' });
+    await saveDynamicRules(rules);
+  });
 }
 
-async function addDynamicKeyword(tag, keyword) {
-  const rules = await loadDynamicRules();
-  if (!rules.keywordRules) rules.keywordRules = {};
-  if (!rules.keywordRules[tag]) rules.keywordRules[tag] = [];
-  if (!rules.keywordRules[tag].includes(keyword)) {
-    rules.keywordRules[tag].push(keyword);
-  }
-  await saveDynamicRules(rules);
+function addDynamicKeyword(tag, keyword) {
+  return runSerializedMutation('dynamic-rules', async () => {
+    const rules = await loadDynamicRules();
+    if (!rules.keywordRules) rules.keywordRules = {};
+    if (!rules.keywordRules[tag]) rules.keywordRules[tag] = [];
+    if (!rules.keywordRules[tag].includes(keyword)) {
+      rules.keywordRules[tag].push(keyword);
+    }
+    await saveDynamicRules(rules);
+  });
 }
 
-async function addDynamicStopWord(word) {
-  const rules = await loadDynamicRules();
-  if (!rules.stopWords) rules.stopWords = [];
-  if (!rules.stopWords.includes(word)) {
-    rules.stopWords.push(word);
-  }
-  await saveDynamicRules(rules);
+function addDynamicStopWord(word) {
+  return runSerializedMutation('dynamic-rules', async () => {
+    const rules = await loadDynamicRules();
+    if (!rules.stopWords) rules.stopWords = [];
+    if (!rules.stopWords.includes(word)) {
+      rules.stopWords.push(word);
+    }
+    await saveDynamicRules(rules);
+  });
 }
 
 // ===== 从用户反馈中学习关键词 =====
-async function learnKeywords(text, tag) {
-  if (!text || !tag) return;
-  const cleaned = cleanTitle(text);
-  const tokens = tokenize(cleaned);
-  if (tokens.length === 0) return;
+function learnKeywords(text, tag) {
+  return runSerializedMutation('dynamic-rules', async () => {
+    if (!text || !tag) return;
+    const cleaned = cleanTitle(text);
+    const tokens = tokenize(cleaned);
+    if (tokens.length === 0) return;
 
-  const rules = await loadDynamicRules();
-  if (!rules.keywordStats) rules.keywordStats = {};
-  if (!rules.keywordStats[tag]) rules.keywordStats[tag] = {};
+    const rules = await loadDynamicRules();
+    if (!rules.keywordStats) rules.keywordStats = {};
+    if (!rules.keywordStats[tag]) rules.keywordStats[tag] = {};
 
-  for (const t of tokens) {
-    rules.keywordStats[tag][t] = (rules.keywordStats[tag][t] || 0) + 1;
-  }
-
-  // 出现 2 次以上且在该标签下显著高频的词提升为动态关键词
-  if (!rules.keywordRules) rules.keywordRules = {};
-  if (!rules.keywordRules[tag]) rules.keywordRules[tag] = [];
-
-  const tagStats = rules.keywordStats[tag];
-  const total = Object.values(tagStats).reduce((a, b) => a + b, 0);
-  for (const [word, count] of Object.entries(tagStats)) {
-    if (count >= 2 && (count / total) > 0.05 && !rules.keywordRules[tag].includes(word)) {
-      rules.keywordRules[tag].push(word);
+    for (const t of tokens) {
+      rules.keywordStats[tag][t] = (rules.keywordStats[tag][t] || 0) + 1;
     }
-  }
 
-  await saveDynamicRules(rules);
+    // 出现 2 次以上且在该标签下显著高频的词提升为动态关键词
+    if (!rules.keywordRules) rules.keywordRules = {};
+    if (!rules.keywordRules[tag]) rules.keywordRules[tag] = [];
+
+    const tagStats = rules.keywordStats[tag];
+    const total = Object.values(tagStats).reduce((a, b) => a + b, 0);
+    for (const [word, count] of Object.entries(tagStats)) {
+      if (count >= 2 && (count / total) > 0.05 && !rules.keywordRules[tag].includes(word)) {
+        rules.keywordRules[tag].push(word);
+      }
+    }
+
+    await saveDynamicRules(rules);
+  });
 }
 
 // ===== 从用户反馈中学习 URL 路径规则 =====
-async function learnPathRule(url, tag) {
-  if (!url || !tag) return;
-  const features = extractUrlFeatures(url);
-  if (!features || features.pathSegments.length === 0) return;
+function learnPathRule(url, tag) {
+  return runSerializedMutation('dynamic-rules', async () => {
+    if (!url || !tag) return;
+    const features = extractUrlFeatures(url);
+    if (!features || features.pathSegments.length === 0) return;
 
-  const rules = await loadDynamicRules();
-  if (!rules.pathStats) rules.pathStats = {};
-  if (!rules.pathStats[tag]) rules.pathStats[tag] = {};
+    const rules = await loadDynamicRules();
+    if (!rules.pathStats) rules.pathStats = {};
+    if (!rules.pathStats[tag]) rules.pathStats[tag] = {};
 
-  for (const seg of features.pathSegments) {
-    if (seg.length < 2) continue;
-    rules.pathStats[tag][seg] = (rules.pathStats[tag][seg] || 0) + 1;
-  }
+    for (const seg of features.pathSegments) {
+      if (seg.length < 2) continue;
+      rules.pathStats[tag][seg] = (rules.pathStats[tag][seg] || 0) + 1;
+    }
 
-  // 出现 2 次以上的路径段加入动态 URL 路径规则
-  if (!rules.urlPathRules) rules.urlPathRules = [];
-  const tagStats = rules.pathStats[tag];
-  for (const [seg, count] of Object.entries(tagStats)) {
-    if (count >= 2 && !rules.urlPathRules.some(r => r.tag === tag && r.patterns.includes('/' + seg + '/'))) {
-      const existing = rules.urlPathRules.find(r => r.tag === tag);
-      if (existing) {
-        existing.patterns.push('/' + seg + '/');
-      } else {
-        rules.urlPathRules.push({ patterns: ['/' + seg + '/'], tag });
+    // 出现 2 次以上的路径段加入动态 URL 路径规则
+    if (!rules.urlPathRules) rules.urlPathRules = [];
+    const tagStats = rules.pathStats[tag];
+    for (const [seg, count] of Object.entries(tagStats)) {
+      if (count >= 2 && !rules.urlPathRules.some(r => r.tag === tag && r.patterns.includes('/' + seg + '/'))) {
+        const existing = rules.urlPathRules.find(r => r.tag === tag);
+        if (existing) {
+          existing.patterns.push('/' + seg + '/');
+        } else {
+          rules.urlPathRules.push({ patterns: ['/' + seg + '/'], tag });
+        }
       }
     }
-  }
 
-  await saveDynamicRules(rules);
+    await saveDynamicRules(rules);
+  });
 }
 
-async function removeDynamicDomainRule(tag) {
-  const rules = await loadDynamicRules();
-  if (rules.domainRules) {
-    rules.domainRules = rules.domainRules.filter(r => r.tag !== tag);
-  }
-  await saveDynamicRules(rules);
+function removeDynamicDomainRule(tag) {
+  return runSerializedMutation('dynamic-rules', async () => {
+    const rules = await loadDynamicRules();
+    if (rules.domainRules) {
+      rules.domainRules = rules.domainRules.filter(r => r.tag !== tag);
+    }
+    await saveDynamicRules(rules);
+  });
 }
 
-async function clearLearnedDomainTags() {
-  const rules = await loadDynamicRules();
-  rules.learnedDomainTag = {};
-  await saveDynamicRules(rules);
+function clearLearnedDomainTags() {
+  return runSerializedMutation('dynamic-rules', async () => {
+    const rules = await loadDynamicRules();
+    rules.learnedDomainTag = {};
+    await saveDynamicRules(rules);
+  });
 }
 
 // ===== 主动学习层（Active Learning）=====
@@ -2754,52 +2795,56 @@ async function getReviewQueue() {
   return await loadReviewQueue();
 }
 
-async function addToReviewQueue(item) {
-  const queue = await loadReviewQueue();
+function addToReviewQueue(item) {
+  return runSerializedMutation('review-queue', async () => {
+    const queue = await loadReviewQueue();
 
-  // 用 URL 去重
-  const existingIndex = queue.findIndex(q => q.url === item.url);
-  if (existingIndex >= 0) {
-    // 更新已有项的建议标签和置信度
-    queue[existingIndex] = { ...queue[existingIndex], ...item, createdAt: Date.now() };
-  } else {
-    queue.unshift(item);
-    if (queue.length > MAX_REVIEW_QUEUE_SIZE) {
-      queue.pop(); // FIFO 淘汰
+    // 用 URL 去重
+    const existingIndex = queue.findIndex(q => q.url === item.url);
+    if (existingIndex >= 0) {
+      // 更新已有项的建议标签和置信度
+      queue[existingIndex] = { ...queue[existingIndex], ...item, createdAt: Date.now() };
+    } else {
+      queue.unshift(item);
+      if (queue.length > MAX_REVIEW_QUEUE_SIZE) {
+        queue.pop(); // FIFO 淘汰
+      }
     }
-  }
 
-  await saveReviewQueue(queue);
+    await saveReviewQueue(queue);
 
-  // 广播队列变化
-  try {
-    chrome.runtime.sendMessage({
-      action: 'reviewQueueChanged',
-      count: queue.length
-    }).catch(() => {});
-  } catch {
-    // 静默失败
-  }
+    // 广播队列变化
+    try {
+      chrome.runtime.sendMessage({
+        action: 'reviewQueueChanged',
+        count: queue.length
+      }).catch(() => {});
+    } catch {
+      // 静默失败
+    }
 
-  return queue.length;
+    return queue.length;
+  });
 }
 
-async function removeFromReviewQueue(id) {
-  const queue = await loadReviewQueue();
-  const newQueue = queue.filter(q => q.id !== id);
-  await saveReviewQueue(newQueue);
+function removeFromReviewQueue(id) {
+  return runSerializedMutation('review-queue', async () => {
+    const queue = await loadReviewQueue();
+    const newQueue = queue.filter(q => q.id !== id);
+    await saveReviewQueue(newQueue);
 
-  // 广播队列变化
-  try {
-    chrome.runtime.sendMessage({
-      action: 'reviewQueueChanged',
-      count: newQueue.length
-    }).catch(() => {});
-  } catch {
-    // 静默失败
-  }
+    // 广播队列变化
+    try {
+      chrome.runtime.sendMessage({
+        action: 'reviewQueueChanged',
+        count: newQueue.length
+      }).catch(() => {});
+    } catch {
+      // 静默失败
+    }
 
-  return newQueue.length;
+    return newQueue.length;
+  });
 }
 
 async function clearReviewQueue() {
@@ -2919,44 +2964,46 @@ async function onUserConfirmTag(queueItem, confirmedTags, action) {
   await removeFromReviewQueue(queueItem.id);
 }
 
-async function updateLearningStats(suggestedTags, confirmedTags, action) {
-  const stats = await loadLearningStats();
-  stats.totalReviewed += 1;
-  stats.lastReviewAt = Date.now();
+function updateLearningStats(suggestedTags, confirmedTags, action) {
+  return runSerializedMutation('learning-stats', async () => {
+    const stats = await loadLearningStats();
+    stats.totalReviewed += 1;
+    stats.lastReviewAt = Date.now();
 
-  if (action === 'accepted') stats.totalAccepted += 1;
-  else if (action === 'modified') stats.totalModified += 1;
-  else if (action === 'ignored') stats.totalIgnored += 1;
+    if (action === 'accepted') stats.totalAccepted += 1;
+    else if (action === 'modified') stats.totalModified += 1;
+    else if (action === 'ignored') stats.totalIgnored += 1;
 
-  // 按建议标签统计接受率
-  for (const tag of suggestedTags) {
-    if (!stats.tagAccuracy[tag]) {
-      stats.tagAccuracy[tag] = { accepted: 0, modified: 0, ignored: 0 };
+    // 按建议标签统计接受率
+    for (const tag of suggestedTags) {
+      if (!stats.tagAccuracy[tag]) {
+        stats.tagAccuracy[tag] = { accepted: 0, modified: 0, ignored: 0 };
+      }
+      if (action === 'accepted') stats.tagAccuracy[tag].accepted += 1;
+      else if (action === 'modified') stats.tagAccuracy[tag].modified += 1;
+      else if (action === 'ignored') stats.tagAccuracy[tag].ignored += 1;
     }
-    if (action === 'accepted') stats.tagAccuracy[tag].accepted += 1;
-    else if (action === 'modified') stats.tagAccuracy[tag].modified += 1;
-    else if (action === 'ignored') stats.tagAccuracy[tag].ignored += 1;
-  }
 
-  // 记录每日准确率历史，供趋势图使用
-  const now = new Date();
-  const dateKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
-  if (!Array.isArray(stats.history)) stats.history = [];
-  let todayEntry = stats.history.find(h => h.date === dateKey);
-  if (!todayEntry) {
-    todayEntry = { date: dateKey, ts: Date.now(), accepted: 0, modified: 0, ignored: 0, total: 0 };
-    stats.history.push(todayEntry);
-  }
-  todayEntry.total += 1;
-  if (action === 'accepted') todayEntry.accepted += 1;
-  else if (action === 'modified') todayEntry.modified += 1;
-  else if (action === 'ignored') todayEntry.ignored += 1;
+    // 记录每日准确率历史，供趋势图使用
+    const now = new Date();
+    const dateKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+    if (!Array.isArray(stats.history)) stats.history = [];
+    let todayEntry = stats.history.find(h => h.date === dateKey);
+    if (!todayEntry) {
+      todayEntry = { date: dateKey, ts: Date.now(), accepted: 0, modified: 0, ignored: 0, total: 0 };
+      stats.history.push(todayEntry);
+    }
+    todayEntry.total += 1;
+    if (action === 'accepted') todayEntry.accepted += 1;
+    else if (action === 'modified') todayEntry.modified += 1;
+    else if (action === 'ignored') todayEntry.ignored += 1;
 
-  // 只保留最近 180 天历史，避免 storage 无限增长
-  const cutoff = Date.now() - 180 * 24 * 60 * 60 * 1000;
-  stats.history = stats.history.filter(h => (h.ts || 0) >= cutoff);
+    // 只保留最近 180 天历史，避免 storage 无限增长
+    const cutoff = Date.now() - 180 * 24 * 60 * 60 * 1000;
+    stats.history = stats.history.filter(h => (h.ts || 0) >= cutoff);
 
-  await saveLearningStats(stats);
+    await saveLearningStats(stats);
+  });
 }
 
 async function autoTagBookmarks(bookmarks, concurrency = 10, options = {}, onProgress = null) {

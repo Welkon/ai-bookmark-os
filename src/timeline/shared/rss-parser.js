@@ -22,11 +22,12 @@
       .replace(/&apos;/g, "'")
       .replace(/&#(\d+);/g, (_, n) => {
         const code = parseInt(n, 10);
-        return code > 0 ? String.fromCharCode(code) : '';
+        // fromCodePoint 才能正确处理增补平面字符（如 emoji），fromCharCode 会产出错位代理半区
+        return code > 0 ? String.fromCodePoint(code) : '';
       })
       .replace(/&#x([0-9a-fA-F]+);/g, (_, n) => {
         const code = parseInt(n, 16);
-        return code > 0 ? String.fromCharCode(code) : '';
+        return code > 0 ? String.fromCodePoint(code) : '';
       })
       .replace(/&amp;/g, '&'); // 必须最后处理，避免二次解码
   }
@@ -54,26 +55,40 @@
     return 0;
   }
 
-  // 提取标签内容（处理 CDATA 与实体），返回第一个匹配的内部文本
+  // 缺 guid/link 的低质量条目：用标题+发布时间的稳定哈希兜底。
+  // 之前的 Math.random() 会让每次拉取都判为“新文章”，重复入库并轰炸通知。
+  function fallbackItemGuid(title, publishedAt) {
+    let hash = 2166136261;
+    const text = `item:${title || ''}:${publishedAt || 0}`;
+    for (let index = 0; index < text.length; index++) {
+      hash ^= text.charCodeAt(index);
+      hash = Math.imul(hash, 16777619);
+    }
+    return `fallback_${(hash >>> 0).toString(36)}`;
+  }
+
+  // 提取标签内容（处理 CDATA 与实体），返回第一个匹配的内部文本。
+  // 允许可选的命名空间前缀（如 <atom:entry>），且开闭标签前缀必须一致，
+  // 否则带命名空间的 Atom（<atom:feed>/<atom:entry>）会解析出 0 条。
   function tagContent(parent, tag) {
     if (!parent) return '';
-    const re = new RegExp('<' + tag + '(?:\\s[^>]*)?>([\\s\\S]*?)</' + tag + '\\s*>', 'i');
+    const re = new RegExp('<(?:([\\w.-]+):)?' + tag + '(?:\\s[^>]*)?>([\\s\\S]*?)</(?:\\1:)?' + tag + '\\s*>', 'i');
     const m = parent.match(re);
     if (!m) return '';
-    let raw = m[1];
+    let raw = m[2];
     // 处理 CDATA 段（可能有多个）
     raw = raw.replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, (_, c) => c);
     return raw.trim();
   }
 
-  // 提取所有指定标签块的内容数组
+  // 提取所有指定标签块的内容数组（同样容忍命名空间前缀，前缀开闭一致）
   function tagBlocks(parent, tag) {
     if (!parent) return [];
-    const re = new RegExp('<' + tag + '(?:\\s[^>]*)?>([\\s\\S]*?)</' + tag + '\\s*>', 'gi');
+    const re = new RegExp('<(?:([\\w.-]+):)?' + tag + '(?:\\s[^>]*)?>([\\s\\S]*?)</(?:\\1:)?' + tag + '\\s*>', 'gi');
     const blocks = [];
     let m;
     while ((m = re.exec(parent)) !== null) {
-      blocks.push(m[1]);
+      blocks.push(m[2]);
     }
     return blocks;
   }
@@ -114,7 +129,9 @@
   }
 
   function extractFeedBlock(text) {
-    const m = text.match(/<feed[\s>][\s\S]*?<\/feed\s*>/i);
+    // 容忍命名空间前缀（<atom:feed>）；未匹配时回退整篇文档，
+    // 配合 tagBlocks 的前缀容忍仍能提取 <atom:entry>。
+    const m = text.match(/<(?:[\w.-]+:)?feed[\s>][\s\S]*?<\/(?:[\w.-]+:)?feed\s*>/i);
     return m ? m[0] : text;
   }
 
@@ -198,7 +215,13 @@
     const title = stripTags(tagContent(channel, 'title'));
     const link = decodeEntities(tagContent(channel, 'link').trim());
     const description = stripTags(tagContent(channel, 'description'));
-    const items = tagBlocks(channel, 'item').map(item => {
+    let itemBlocks = tagBlocks(channel, 'item');
+    if (itemBlocks.length === 0) {
+      // RSS 1.0 (RDF)：<item> 是 <channel> 的兄弟节点而非子节点。
+      // 此前只在 channel 块内找 item，RDF 源解析出 0 条后被误报为“无文章”。
+      itemBlocks = tagBlocks(text, 'item');
+    }
+    const items = itemBlocks.map(item => {
       const guid = decodeEntities(tagContent(item, 'guid').trim());
       const itemTitle = stripTags(tagContent(item, 'title'));
       let itemLink = tagContent(item, 'link').trim();
@@ -225,7 +248,7 @@
       const contentSnippet = stripTags(contentRaw || descriptionRaw).slice(0, 1000);
       const imageUrl = extractImageUrl(item, contentRaw, descriptionRaw);
       return {
-        guid: guid || itemLink || itemTitle || String(Math.random()),
+        guid: guid || itemLink || itemTitle || fallbackItemGuid(itemTitle, pubDate),
         title: itemTitle,
         link: itemLink,
         author,
@@ -265,7 +288,7 @@
       const contentSnippet = stripTags(contentRaw || summaryRaw).slice(0, 1000);
       const imageUrl = extractImageUrl(entry, contentRaw, summaryRaw);
       return {
-        guid: id || eLink || eTitle || String(Math.random()),
+        guid: id || eLink || eTitle || fallbackItemGuid(eTitle, published),
         title: eTitle,
         link: eLink,
         author,
@@ -322,12 +345,12 @@
     if (ct.includes('json') || trimmed.startsWith('{')) {
       return parseJsonFeed(trimmed);
     }
-    // Atom
-    if (/<feed[\s>]/i.test(trimmed) || /<entry[\s>]/i.test(trimmed)) {
+    // Atom（容忍命名空间前缀，如 <atom:feed>/<atom:entry>）
+    if ( /<(?:[\w.-]+:)?feed[\s>]/i.test(trimmed) || /<(?:[\w.-]+:)?entry[\s>]/i.test(trimmed)) {
       return parseAtom(trimmed);
     }
-    // RSS 2.0
-    if (/<rss[\s>]/i.test(trimmed) || /<channel[\s>]/i.test(trimmed)) {
+    // RSS 2.0 / RSS 1.0 (RDF)
+    if ( /<(?:[\w.-]+:)?rss[\s>]/i.test(trimmed) || /<channel[\s>]/i.test(trimmed) || /<rdf:RDF[\s>]/i.test(trimmed)) {
       return parseRss(trimmed);
     }
     // 兜底：当作 RSS 尝试

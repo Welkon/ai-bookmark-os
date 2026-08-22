@@ -35,7 +35,14 @@ export async function openOrFocusExtensionPage(path: string) {
   const existing = tabs.find((tab) => getExtensionTabPath(tab.url) === targetPath);
   if (existing) {
     const shouldReload = existing.url === targetUrl && RELOAD_ON_FOCUS_PATHS.has(targetPath);
-    if (await focusExtensionTab(existing, targetUrl)) {
+    // 查询与聚焦之间标签页可能已被关闭：聚焦失败时回退到新建，而不是直接抛错。
+    let focused = false;
+    try {
+      focused = await focusExtensionTab(existing, targetUrl);
+    } catch (error) {
+      console.warn('Focus existing extension tab failed; creating a new one.', error);
+    }
+    if (focused) {
       if (shouldReload && existing.id != null) {
         await chrome.tabs.reload(existing.id, { bypassCache: true });
       }

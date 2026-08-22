@@ -356,18 +356,52 @@ export async function chat(
   throw lastError;
 }
 
-/** 规范化 LLM 文本：去 BOM、全角括号、常见包装 */
+/**
+ * 逐字符扫描：仅在 JSON 双引号字符串字面量之外做变换。
+ * 此前的全局 replace 会把字符串值内部的内容一并改写——例如摘要“教程：入门”
+ * 的全角冒号被换成半角、英文撇号（it's）被换成引号——修复“成功”后写入
+ * 标签/缓存的就是被篡改的数据。开/闭引号、转义与 sliceBalancedJson 同一套规则。
+ */
+function mapOutsideDoubleQuotedStrings(
+  text: string,
+  mapper: (ch: string, index: number, source: string) => string,
+): string {
+  let out = '';
+  let inStr = false;
+  let esc = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (inStr) {
+      out += ch;
+      if (esc) esc = false;
+      else if (ch === '\\') esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') {
+      inStr = true;
+      out += ch;
+      continue;
+    }
+    out += mapper(ch, i, text);
+  }
+  return out;
+}
+
+const FULLWIDTH_STRUCTURAL = new Map([
+  ['：', ':'],
+  ['［', '['],
+  ['］', ']'],
+  ['｛', '{'],
+  ['｝', '}'],
+]);
+
+/** 规范化 LLM 文本：去 BOM、全角括号、常见包装。全角结构字符只在字符串外替换。 */
 function normalizeLlmText(text: string): string {
-  return String(text ?? '')
+  const cleaned = mapOutsideDoubleQuotedStrings(String(text ?? ''), (ch) => FULLWIDTH_STRUCTURAL.get(ch) ?? ch)
     .replace(/^\uFEFF/, '')
-    .replace(/\u00a0/g, ' ')
-    // 全角括号 → 半角，避免某些中文模型输出 ［{...}］
-    .replace(/［/g, '[')
-    .replace(/］/g, ']')
-    .replace(/｛/g, '{')
-    .replace(/｝/g, '}')
-    .replace(/：/g, ':')
-    .trim();
+    .replace(/\u00a0/g, ' ');
+  return cleaned.trim();
 }
 
 /** 从任意文本中截取首个平衡的 JSON 数组/对象 */
@@ -404,11 +438,28 @@ function sliceBalancedJson(text: string): string | null {
   return null;
 }
 
-/** 尝试修复轻微损坏的 JSON（尾逗号、单引号键值） */
+/** 尝试修复轻微损坏的 JSON（尾逗号、单引号键值）。
+ *  两类修复都只在双引号字符串之外进行；单引号仅在“定界符位置”转成双引号，
+ *  否则 it's 这类撇号会被误换成引号，产出值被改写的非法 JSON。 */
 function softRepairJson(raw: string): string {
-  return raw
-    .replace(/,\s*([}\]])/g, '$1')
-    .replace(/'/g, '"');
+  const withoutTrailingCommas = mapOutsideDoubleQuotedStrings(raw, (ch, i, src) => {
+    if (ch !== ',') return ch;
+    for (let j = i + 1; j < src.length; j++) {
+      const next = src[j];
+      if (next === ' ' || next === '\t' || next === '\n' || next === '\r') continue;
+      if (next === '}' || next === ']') return '';
+      return ch;
+    }
+    return ch;
+  });
+  return mapOutsideDoubleQuotedStrings(withoutTrailingCommas, (ch, i, src) => {
+    if (ch !== "'") return ch;
+    const prev = i > 0 ? src[i - 1] : '';
+    const next = i + 1 < src.length ? src[i + 1] : '';
+    const prevIsDelimiter = prev === '' || /[{[:,\s]/.test(prev);
+    const nextIsDelimiter = next === '' || /[}\],:\s]/.test(next);
+    return prevIsDelimiter || nextIsDelimiter ? '"' : ch;
+  });
 }
 
 /** 从 LLM 回复中提取 JSON（容忍 markdown 围栏、前后缀说明、轻度格式错误） */
@@ -492,11 +543,17 @@ export async function listModels(settings: Settings): Promise<string[]> {
     headers = { Authorization: `Bearer ${settings.apiKey}` };
   }
 
-  const res = await fetch(url, { headers });
+  // 与 chat 一致走 SW 代理 + 超时，避免模型列表请求挂到浏览器默认超时。
+  const res = await fetchWithTimeout(url, { method: 'GET', headers }, 15_000);
   if (!res.ok) {
-    throw new Error(`获取模型列表失败 (${res.status}): ${await res.text().catch(() => '')}`);
+    throw new Error(`获取模型列表失败 (${res.status}): ${res.text || ''}`);
   }
-  const data = await res.json();
+  let data: any;
+  try {
+    data = JSON.parse(res.text);
+  } catch {
+    throw new Error('获取模型列表失败：响应不是有效 JSON');
+  }
 
   let ids: string[];
   if (style === 'gemini') {

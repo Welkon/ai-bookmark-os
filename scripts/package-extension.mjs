@@ -187,6 +187,7 @@ const manifest = {
   permissions: [
     'bookmarks',
     'storage',
+    'unlimitedStorage',
     'contextMenus',
     'activeTab',
     'alarms',

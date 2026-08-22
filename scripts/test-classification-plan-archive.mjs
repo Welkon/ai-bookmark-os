@@ -213,6 +213,46 @@ async function testArchiveWriteFailureIsSurfacedAndDoesNotPretendToSucceed() {
   await assert.rejects(() => archiveClassificationPlan(draft({ draftId: 'cannot-write' })), /storage write failed/);
 }
 
+async function testUnpinWouldEvictIsRejectedInsteadOfSilentlyDeleting() {
+  const storage = createStorage();
+  globalThis.chrome = { storage };
+  const mod = await importTypeScript('src/core/classificationPlanArchive.ts');
+  const originalNow = Date.now;
+  try {
+    // 先归档一个旧版本并星标（此时数量未满，不会被轮换）。
+    Date.now = () => 500;
+    await mod.archiveClassificationPlan(draft({ draftId: 'pinned-old', createdAt: 1 }));
+    await mod.toggleClassificationPlanVersionPin('pinned-old');
+    // 再归档 11 个更新的非星标版本（归档时间递增，非星标池超上限）。
+    for (let index = 0; index < 11; index += 1) {
+      Date.now = () => 1_000 + index;
+      await mod.archiveClassificationPlan(draft({ draftId: `newer-${index}`, createdAt: 10 + index }));
+    }
+  } finally {
+    Date.now = originalNow;
+  }
+
+  // 回归：取消该旧版本星标会把它挤出轮换池（等价于静默删除），
+  // 必须拒绝并抛出机器可读错误码，由 UI 指引用户改用显式删除。
+  await assert.rejects(
+    () => mod.toggleClassificationPlanVersionPin('pinned-old'),
+    /UNPIN_WOULD_EVICT_VERSION/,
+  );
+  const afterRejection = await mod.listClassificationPlanVersions();
+  assert.equal(afterRejection.some((version) => version.versionId === 'pinned-old'), true,
+    '拒绝后旧版本必须仍然存在');
+  assert.equal(afterRejection.find((version) => version.versionId === 'pinned-old')?.pinned, true,
+    '拒绝后星标状态不得改变');
+
+  // 对照：星标/取消一个最新的非星标版本不受影响（取消后仍在保留上限内）。
+  Date.now = () => 5_000;
+  await mod.toggleClassificationPlanVersionPin('newer-10');
+  await mod.toggleClassificationPlanVersionPin('newer-10');
+  const final = await mod.listClassificationPlanVersions();
+  assert.equal(final.some((version) => version.versionId === 'newer-10'), true);
+  assert.equal(final.find((version) => version.versionId === 'newer-10')?.pinned, undefined);
+}
+
 async function run() {
   await testMissingAndMalformedStorageAreSafeEmpty();
   await testArchiveKeepsOnlyCompactPlanData();
@@ -220,6 +260,7 @@ async function run() {
   await testArchiveDeduplicatesAndKeepsTheTenNewestVersions();
   await testInvalidStoredVersionIsIgnoredWithoutDiscardingValidVersion();
   await testArchiveWriteFailureIsSurfacedAndDoesNotPretendToSucceed();
+  await testUnpinWouldEvictIsRejectedInsteadOfSilentlyDeleting();
   console.log('classification plan archive tests passed');
 }
 

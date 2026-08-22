@@ -86,7 +86,20 @@ assert.ok(
 // ── importBundle 端到端：确认规范化真正接入写入路径（防止 validator 只定义未调用）──
 function createStorageEnv(initial = {}) {
   const values = structuredClone(initial);
+  const mergeCalls = [];
   globalThis.chrome = {
+    runtime: {
+      // 模拟后台单写者：labelCacheMerge 消息合并条目（导入必须走该通道而非直写 storage）
+      async sendMessage(message) {
+        if (message?.action === 'labelCacheMerge') {
+          mergeCalls.push(message.cacheEntries.length);
+          const current = (values.labelCache && typeof values.labelCache === 'object') ? values.labelCache : {};
+          values.labelCache = { ...current, ...Object.fromEntries(message.cacheEntries || []) };
+          return { success: true };
+        }
+        return { success: false, error: 'unknown_action' };
+      },
+    },
     storage: {
       local: {
         async get(keys) {
@@ -99,14 +112,14 @@ function createStorageEnv(initial = {}) {
       },
     },
   };
-  return values;
+  return { values, mergeCalls };
 }
 
 const { importBundle } = await importTypeScript('src/core/transfer.ts');
 
 // 损坏的 classifyResult 不得落盘；损坏的 labelCache 条目被剔除
 {
-  const store = createStorageEnv({ labelCache: { existing: { summary: 'old', tags: ['x'] } } });
+  const { values: store, mergeCalls } = createStorageEnv({ labelCache: { existing: { summary: 'old', tags: ['x'] } } });
   const result = await importBundle(JSON.stringify({
     app: 'ai-bookmark-os',
     version: 1,
@@ -121,11 +134,27 @@ const { importBundle } = await importTypeScript('src/core/transfer.ts');
     ['existing', 'good'],
     '仅合法标签缓存条目并入，本地已有条目保留',
   );
+  assert.ok(mergeCalls.length === 1 && mergeCalls[0] === 1, '标签缓存必须经 labelCacheMerge 单写者通道合并');
+}
+
+// 大缓存必须分块发送，且全部并入
+{
+  const bigCache = {};
+  for (let index = 0; index < 450; index += 1) bigCache[`k${index}`] = { summary: 's', tags: ['t'] };
+  const { values: store, mergeCalls } = createStorageEnv();
+  await importBundle(JSON.stringify({
+    app: 'ai-bookmark-os',
+    version: 1,
+    exportedAt: 1,
+    labelCache: bigCache,
+  }));
+  assert.deepEqual(mergeCalls, [200, 200, 50], '超过单块上限的缓存必须分块合并');
+  assert.equal(Object.keys(store.labelCache).length, 450, '分块合并后条目完整');
 }
 
 // 合法 classifyResult 正常落盘并保留嵌套结构
 {
-  const store = createStorageEnv();
+  const { values: store } = createStorageEnv();
   await importBundle(JSON.stringify({
     app: 'ai-bookmark-os',
     version: 1,
@@ -141,7 +170,7 @@ const { importBundle } = await importTypeScript('src/core/transfer.ts');
 
 // 非对象 settings（字符串）不得注入索引字符键
 {
-  const store = createStorageEnv({ settings: { language: 'zh', apiKey: 'local-key' } });
+  const { values: store } = createStorageEnv({ settings: { language: 'zh', apiKey: 'local-key' } });
   await importBundle(JSON.stringify({
     app: 'ai-bookmark-os',
     version: 1,

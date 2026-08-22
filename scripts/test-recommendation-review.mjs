@@ -293,12 +293,13 @@ await helpers.enqueueRecommendationReviewItem(makeReview('review-stale-move', 's
 nativeBookmarks.set('stale-move', { ...nativeBookmarks.get('stale-move'), parentId: 'folder-source' });
 const stateBeforeStaleMove = await helpers.getRecommendationLearningState();
 const staleMove = await helpers.resolveRecommendationReview({ operationId: 'confirm-stale-move', reviewId: 'review-stale-move', decision: 'accept' });
-assert.deepEqual({ ...staleMove }, { success: false, error: 'bookmark_changed' });
+assert.deepEqual({ ...staleMove }, { success: true, decision: 'accept', staleDiscarded: true },
+  'superseded move observations must be discarded as stale instead of hard-erroring');
 state = await helpers.getRecommendationLearningState();
 assert.equal(state.recentFeedback.length, stateBeforeStaleMove.recentFeedback.length, 'stale move observations must not create learning feedback');
 assert.deepEqual({ ...state.stats }, { ...stateBeforeStaleMove.stats }, 'stale move observations must not change learning stats');
 assert.equal(state.rules.length, stateBeforeStaleMove.rules.length, 'stale move observations must not change learned rules');
-assert.ok(state.reviewQueue.some(item => item.id === 'review-stale-move'), 'stale move observations must remain available for explicit removal');
+assert.ok(!state.reviewQueue.some(item => item.id === 'review-stale-move'), 'stale move observations must be removed automatically');
 
 nativeBookmarks.set('stale-url', { id: 'stale-url', title: 'stale', url: 'https://changed.test/page', parentId: 'folder-source' });
 mirroredBookmarks.push({ id: 'stale-url', title: 'stale', url: 'https://changed.test/page', parentId: 'folder-source', folderPath: 'Inbox', tags: [] });
@@ -307,9 +308,10 @@ conflictStore.snapshots.push(makeSnapshot('rec-stale-url', 'stale-url'));
 storage.set(context.RECOMMENDATION_STORE_KEY, conflictStore);
 await helpers.enqueueRecommendationReviewItem(makeReview('review-stale-url', 'stale-url', 'rec-stale-url'));
 const staleReject = await helpers.resolveRecommendationReview({ operationId: 'reject-stale-url', reviewId: 'review-stale-url', decision: 'reject' });
-assert.deepEqual({ ...staleReject }, { success: false, error: 'bookmark_changed' });
+assert.deepEqual({ ...staleReject }, { success: true, decision: 'reject', staleDiscarded: true },
+  'reviews whose bookmark URL no longer matches must be discarded as stale instead of hard-erroring');
 state = await helpers.getRecommendationLearningState();
-assert.ok(state.reviewQueue.some(item => item.id === 'review-stale-url'), 'stale review must remain available for explicit removal');
+assert.ok(!state.reviewQueue.some(item => item.id === 'review-stale-url'), 'stale reviews must be removed automatically');
 
 const stale = helpers.normalizeRecommendationReviewItem({
   ...makeReview('stale', 'b1', 'rec-b1'),

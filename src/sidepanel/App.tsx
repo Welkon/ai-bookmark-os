@@ -50,10 +50,11 @@ import {
   renameNode,
 } from '../core/treeEdit';
 import { loadSettings } from '../core/settings';
+import { downloadExport, importBundle } from '../core/transfer';
 import { DEFAULT_SETTINGS, fontCss, type Settings } from '../types';
 import { applyColorMode, t } from '../core/i18n';
 import { Tree, type TreeEditHandlers } from './Tree';
-import { entriesSince, type ChangelogEntry } from '../core/changelog';
+import { resolveWhatsNewEntries, type ChangelogEntry } from '../core/changelog';
 import { resolveLang } from '../core/i18n';
 import { openOrFocusExtensionPage } from '../core/pageRouter';
 import { ChevronDown, FolderTree } from 'lucide-react';
@@ -73,6 +74,7 @@ import { LiveBookmarkTree } from './LiveBookmarkTree';
 import { ChangeHistoryTree } from './ChangeHistoryTree';
 import {
   archiveClassificationPlan,
+  deleteClassificationPlanVersion,
   getClassificationPlanVersionId,
   listClassificationPlanVersions,
   toggleClassificationPlanVersionPin,
@@ -304,11 +306,16 @@ export function App() {
   const [hasBackup, setHasBackup] = useState(false);
   const [canUndo, setCanUndo] = useState(false);
   const [undoing, setUndoing] = useState(false);
+  const [backupDownloading, setBackupDownloading] = useState(false);
   const [notice, setNotice] = useState('');
   const [failedIncrementalQueue, setFailedIncrementalQueue] = useState<IncrementalQueueEntry[]>([]);
   const [incrementalQueueTick, setIncrementalQueueTick] = useState(0);
   const [incrementalQueueAction, setIncrementalQueueAction] = useState(false);
   const [estimate, setEstimate] = useState<PendingEstimate | null>(null);
+  const [showDataModal, setShowDataModal] = useState(false);
+  const [dataBusy, setDataBusy] = useState<'' | 'export' | 'import'>('');
+  const [dataError, setDataError] = useState('');
+  const [dataSuccess, setDataSuccess] = useState('');
   const [showPartialModal, setShowPartialModal] = useState(false);
   const [folders, setFolders] = useState<BookmarkFolderOption[]>([]);
   const [selectedDirectoryId, setSelectedDirectoryId] = useState('');
@@ -317,6 +324,17 @@ export function App() {
   const [partialError, setPartialError] = useState('');
   const [whatsNew, setWhatsNew] = useState<{ to: string; entries: ChangelogEntry[] } | null>(null);
   const [uiSettings, setUiSettings] = useState<Settings>(DEFAULT_SETTINGS);
+  // 非持久横幅不应无限残留：提示 8 秒后自动消失；切换工作区视图时清掉旧提示与错误，
+  // 否则用户浏览其他 Tab 时会把上一次操作的旧状态误判为当前状态。
+  useEffect(() => {
+    if (!notice) return;
+    const timer = window.setTimeout(() => setNotice(''), 8000);
+    return () => window.clearTimeout(timer);
+  }, [notice]);
+  useEffect(() => {
+    setError('');
+    setNotice('');
+  }, [workspaceView]);
   const abortRef = useRef<AbortController | null>(null);
   const classificationLockRef = useRef(false);
   const classificationRunRef = useRef(0);
@@ -338,6 +356,58 @@ export function App() {
     setShowApplyModal(false);
   }, []);
   const closeEstimate = useCallback(() => setEstimate(null), []);
+  const closeDataModal = useCallback(() => {
+    setShowDataModal(false);
+    setDataError('');
+    setDataSuccess('');
+  }, []);
+  // 分类数据导出/导入（transfer.ts）：此前模块已具备完整的导出导入与校验逻辑，
+  // 但没有任何 UI 入口，属于功能闭环缺口（changelog 已宣称该能力）。
+  const doExportData = useCallback(async () => {
+    if (dataBusy) return;
+    setDataBusy('export');
+    setDataError('');
+    setDataSuccess('');
+    try {
+      await downloadExport();
+    } catch (e) {
+      const isZh = resolveLang(uiSettings.language) === 'zh';
+      setDataError(isZh
+        ? `导出失败：${(e as Error).message || '请重试'}`
+        : `Export failed: ${(e as Error).message || 'please retry'}`);
+    } finally {
+      setDataBusy('');
+    }
+  }, [dataBusy, uiSettings.language]);
+
+  const doImportData = useCallback(async (file: File) => {
+    if (dataBusy) return;
+    setDataBusy('import');
+    setDataError('');
+    setDataSuccess('');
+    const isZh = resolveLang(uiSettings.language) === 'zh';
+    try {
+      const text = await file.text();
+      const imported = await importBundle(text);
+      setDataSuccess(isZh
+        ? `导入完成：合并 ${imported.cacheEntries} 条标签缓存${imported.hasResult ? '，并恢复了分类方案' : ''}。工作台即将刷新。`
+        : `Imported: merged ${imported.cacheEntries} cache entries${imported.hasResult ? ' and restored the plan' : ''}. Reloading workspace…`);
+      // 导入会覆盖 classifyResult 与设置：整页刷新是最可靠的状态对账方式。
+      window.setTimeout(() => window.location.reload(), 1200);
+    } catch (e) {
+      const raw = (e as Error).message || String(e);
+      const mapped = raw === 'INVALID_JSON'
+        ? (isZh ? '文件不是有效的 JSON。' : 'File is not valid JSON.')
+        : raw === 'INVALID_BUNDLE'
+          ? (isZh ? '数据包格式不符合要求（缺少必要字段或版本不受支持）。' : 'Bundle format is invalid (missing fields or unsupported version).')
+          : raw === 'label_cache_write_failed'
+            ? (isZh ? '标签缓存写入失败，请稍后重试。' : 'Failed to write label cache; please retry.')
+            : (isZh ? `导入失败：${raw}` : `Import failed: ${raw}`);
+      setDataError(mapped);
+    } finally {
+      setDataBusy('');
+    }
+  }, [dataBusy, uiSettings.language]);
   const closeWhatsNew = useCallback(() => {
     setWhatsNew(null);
     void chrome.storage.local.remove('pendingWhatsNew');
@@ -347,6 +417,12 @@ export function App() {
   // 关闭预估弹窗不受 classificationPending 约束：runClassify 一进入就会清空 estimate，
   // 所以弹窗仍在时该标志只可能来自后台增量分类，禁用关闭会把侧栏锁死在灰按钮遮罩里。
   const estimateDialogRef = useDialogAccessibility(!!estimate, closeEstimate);
+  const dataImportInputRef = useRef<HTMLInputElement>(null);
+  const dataDialogRef = useDialogAccessibility(
+    showDataModal,
+    () => { if (!dataBusy) closeDataModal(); },
+    !dataBusy,
+  );
   const whatsNewDialogRef = useDialogAccessibility(!!whatsNew, closeWhatsNew);
   const d = t(uiSettings.language);
   const partialText = resolveLang(uiSettings.language) === 'zh'
@@ -556,16 +632,17 @@ export function App() {
         activeDraftKeyRef.current = initialKey;
         await refreshDraftStatuses(nextDrafts, snapshot);
       } catch (e) {
-        if (!disposed) setError(`无法读取当前书签树： ${(e as Error).message}`);
+        if (!disposed) setError(`${t(uiSettingsRef.current.language).liveTreeReadFailedPrefix} ${(e as Error).message}`);
       }
     };
     void loadWorkspace();
 
-    // 自动更新后首次打开：展示「新版本内容」弹窗（跨多版本更新会累积展示）
+    // 自动更新后首次打开：展示「新版本内容」弹窗（跨多版本更新会累积展示）。
+    // CHANGELOG 未维护到目标版本时仍有通用升级提示（resolveWhatsNewEntries）。
     chrome.storage.local.get('pendingWhatsNew').then((data) => {
       const p = data.pendingWhatsNew as { from: string; to: string } | undefined;
       if (!p) return;
-      const entries = entriesSince(p.from, p.to);
+      const entries = resolveWhatsNewEntries(p.from, p.to);
       if (entries.length > 0) setWhatsNew({ to: p.to, entries });
       else chrome.storage.local.remove('pendingWhatsNew');
     });
@@ -599,7 +676,7 @@ export function App() {
         void loadClassificationWorkspace().then(setWorkspace);
       }
       if (changes.classificationPlanArchive) {
-        void refreshHistoricalVersions().catch(() => setError('无法读取历史分类版本。'));
+        void refreshHistoricalVersions().catch(() => setError(t(uiSettingsRef.current.language).historyReadFailed));
       }
       if (changes.classifyResult || Object.keys(changes).some((key) => key.startsWith('partialClassifyResult:'))) {
         void (async () => {
@@ -840,7 +917,9 @@ export function App() {
             : { phase: 'idle', done: 0, total: 0 });
         }
         if (!disposed && exhausted) {
-          setError(`${d.classifyFailed}: ${terminalError.message || 'incremental_classification_failed'}`);
+          // 本 effect 刻意不依赖 uiSettings（避免语言切换重启增量流程），
+          // 因此这里不能用渲染时闭包里的 d：语言切换后报错会一直是旧语言。
+          setError(`${t(uiSettingsRef.current.language).classifyFailed}: ${terminalError.message || 'incremental_classification_failed'}`);
         }
       } finally {
         incrementalRunRef.current = false;
@@ -913,7 +992,7 @@ export function App() {
   const operationBusy = running || classificationPending || checkingCompatibility || applying || undoing || savingDraft;
 
   const openAiClassificationSettings = useCallback(() => {
-    setError('请先完成 AI 金字塔分类供应商设置，正在打开 AI 辅助分类设置。');
+    setError(t(uiSettingsRef.current.language).providerSetupOpening);
     void openOrFocusExtensionPage('pages/settings/settings.html#ai');
   }, []);
 
@@ -1446,7 +1525,7 @@ export function App() {
       setDraftStatuses((previous) => ({ ...previous, [storageKey]: status }));
       if (activeDraftKeyRef.current === storageKey) setDraftStatus(status);
     } catch (e) {
-      setError(`保存分类方案失败：${(e as Error).message}`);
+      setError(`${t(uiSettingsRef.current.language).saveDraftFailedPrefix}${(e as Error).message}`);
     } finally {
       draftSaveLockRef.current = false;
       setSavingDraft(false);
@@ -1514,16 +1593,27 @@ export function App() {
 
 
   const downloadBackup = useCallback(async () => {
-    const backup = await getBackup();
-    if (!backup) return;
-    const html = backupToHtml(backup);
-    const url = URL.createObjectURL(new Blob([html], { type: 'text/html' }));
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `bookmarks-backup-${new Date(backup.createdAt).toISOString().slice(0, 10)}.html`;
-    a.click();
-    URL.revokeObjectURL(url);
-  }, []);
+    // Prevent duplicate downloads from double-clicking; on failure, give explicit feedback instead of staying silent (unhandled rejection).
+    if (backupDownloading) return;
+    setBackupDownloading(true);
+    try {
+      const backup = await getBackup();
+      if (!backup) return;
+      const html = backupToHtml(backup);
+      const url = URL.createObjectURL(new Blob([html], { type: 'text/html' }));
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `bookmarks-backup-${new Date(backup.createdAt).toISOString().slice(0, 10)}.html`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      setError(resolveLang(uiSettings.language) === 'zh'
+        ? `备份下载失败：${(e as Error).message || '请重试'}`
+        : `Backup download failed: ${(e as Error).message || 'please retry'}`);
+    } finally {
+      setBackupDownloading(false);
+    }
+  }, [backupDownloading, uiSettings.language]);
 
   const bookmarkById = useMemo(() => new Map(bookmarks.map((b) => [b.id, b])), [bookmarks]);
   const excludedBookmarks = useMemo(() => (
@@ -1547,13 +1637,18 @@ export function App() {
         l?.tags?.some((tag) => String(tag ?? '').toLowerCase().includes(q))
       );
     };
+    // 分类名命中时保留该目录及其整棵子树：搜“设计”应看到设计分类下的内容，
+    // 而不是因为没有书签字段命中就显示“没有匹配的书签”。
     const filter = (nodes: CategoryNode[]): CategoryNode[] =>
       nodes
-        .map((n) => ({
-          ...n,
-          children: n.children ? filter(n.children) : undefined,
-          bookmarkIds: n.bookmarkIds?.filter(match),
-        }))
+        .map((n) => {
+          if (n.name.toLowerCase().includes(q)) return n;
+          return {
+            ...n,
+            children: n.children ? filter(n.children) : undefined,
+            bookmarkIds: n.bookmarkIds?.filter(match),
+          };
+        })
         .filter((n) => (n.bookmarkIds?.length ?? 0) > 0 || (n.children?.length ?? 0) > 0);
     return filter(viewedResult.tree);
   }, [viewedResult, search, bookmarkById]);
@@ -1596,16 +1691,29 @@ export function App() {
               <span className="count-chip">{bookmarks.length}</span>
             </div>
             <div className="topbar-actions">
-              <button type="button" className="topbar-nav-btn" onClick={() => openExtensionPage('pages/standalone/standalone.html')}>工作台</button>
-              <button type="button" className="topbar-nav-btn is-active" aria-current="page">AI 分类</button>
-              <button type="button" className="topbar-nav-btn" onClick={() => openExtensionPage('ai/bookmark-nav.html')}>书签导航</button>
-              <button type="button" className="topbar-nav-btn" onClick={() => openExtensionPage('pages/checker/checker.html')}>失效检查</button>
-              <button type="button" className="topbar-nav-btn" onClick={() => openExtensionPage('pages/graph/graph.html')}>图谱</button>
+              <button type="button" className="topbar-nav-btn" onClick={() => openExtensionPage('pages/standalone/standalone.html')}>{d.navWorkbench}</button>
+              <button type="button" className="topbar-nav-btn is-active" aria-current="page">{d.navAiClassify}</button>
+              <button type="button" className="topbar-nav-btn" onClick={() => openExtensionPage('ai/bookmark-nav.html')}>{d.navBookmarkNav}</button>
+              <button type="button" className="topbar-nav-btn" onClick={() => openExtensionPage('pages/checker/checker.html')}>{d.navChecker}</button>
+              <button type="button" className="topbar-nav-btn" onClick={() => openExtensionPage('pages/graph/graph.html')}>{d.navGraph}</button>
               <button
                 type="button"
                 className="icon-btn"
-                title="AI 设置"
-                aria-label="AI 设置"
+                title={resolveLang(uiSettings.language) === 'zh' ? '分类数据导出 / 导入' : 'Export / import classification data'}
+                aria-label={resolveLang(uiSettings.language) === 'zh' ? '分类数据导出 / 导入' : 'Export / import classification data'}
+                onClick={() => setShowDataModal(true)}
+              >
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                  <ellipse cx="12" cy="5" rx="9" ry="3" />
+                  <path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3" />
+                  <path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5" />
+                </svg>
+              </button>
+              <button
+                type="button"
+                className="icon-btn"
+                title={d.navAiSettings}
+                aria-label={d.navAiSettings}
                 onClick={() => openExtensionPage('pages/settings/settings.html#ai')}
               >
                 <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -1654,7 +1762,9 @@ export function App() {
               </svg>
               <input
                 className="search-input"
-                placeholder={d.searchPlaceholder}
+                placeholder={workspaceView === 'draft' ? d.searchPlaceholder : d.searchDraftOnly}
+                title={workspaceView === 'draft' ? undefined : d.searchDraftOnly}
+                disabled={workspaceView !== 'draft'}
                 value={search}
                 onChange={(e) => setSearch(e.target.value)}
               />
@@ -1682,10 +1792,10 @@ export function App() {
                         .catch((e) => setError(`无法刷新当前书签树： ${(e as Error).message}`));
                     }}
                   >
-                    刷新当前树
+                    {d.refreshLiveTree}
                   </button>
                   <button type="button" className="btn btn-primary btn-sm" onClick={startClassify} disabled={operationBusy}>
-                    {result ? '重新全量分类' : d.classify}
+                    {result ? d.reclassifyAll : d.classify}
                   </button>
                   <button
                     type="button"
@@ -1694,7 +1804,7 @@ export function App() {
                     disabled={operationBusy}
                   >
                     <FolderTree size={14} aria-hidden="true" />
-                    {selectedLiveFolder?.kind === 'folder' ? '对所选目录分类' : partialText.action}
+                    {selectedLiveFolder?.kind === 'folder' ? d.classifySelectedFolder : partialText.action}
                   </button>
                 </>
               ) : workspaceView === 'draft' ? (
@@ -1820,10 +1930,47 @@ export function App() {
                       try {
                         await toggleClassificationPlanVersionPin(selectedHistoricalVersion.versionId);
                         await refreshHistoricalVersions();
-                      } catch { /* ignore */ }
+                      } catch (e) {
+                        // 取消星标会因保留上限间接删除旧版本：明确拒绝并指向删除按钮。
+                        const isZh = resolveLang(uiSettings.language) === 'zh';
+                        setError((e as Error).message === 'UNPIN_WOULD_EVICT_VERSION'
+                          ? (isZh
+                            ? '该版本取消星标后会因超出保留数量被自动删除。如需删除请直接使用“删除版本”按钮，或保留星标。'
+                            : 'Unpinning this old version would evict it beyond the retention limit. Use "Delete version" to remove it, or keep it pinned.')
+                          : (isZh
+                            ? `更新星标失败：${(e as Error).message || '请重试'}`
+                            : `Failed to update pin: ${(e as Error).message || 'please retry'}`));
+                      }
                     }}
                   >
                     {selectedHistoricalVersion.pinned ? d.unpinVersion : d.pinVersion}
+                  </button>
+                )}
+                {isHistoricalVersion && selectedHistoricalVersion && (
+                  <button
+                    type="button"
+                    className="btn btn-danger btn-sm"
+                    title={resolveLang(uiSettings.language) === 'zh' ? '删除该历史版本' : 'Delete this version'}
+                    disabled={operationBusy}
+                    onClick={async () => {
+                      const isZh = resolveLang(uiSettings.language) === 'zh';
+                      const confirmText = isZh
+                        ? `确定删除历史版本 ${new Date(selectedHistoricalVersion.archivedAt).toLocaleString()}？此操作不可恢复。`
+                        : `Delete the version archived at ${new Date(selectedHistoricalVersion.archivedAt).toLocaleString()}? This cannot be undone.`;
+                      if (!confirm(confirmText)) return;
+                      try {
+                        await deleteClassificationPlanVersion(selectedHistoricalVersion.versionId);
+                        // refreshHistoricalVersions 会在选中版本消失时自动重置选择。
+                        await refreshHistoricalVersions();
+                        setNotice(isZh ? '已删除该历史版本。' : 'Version deleted.');
+                      } catch (e) {
+                        setError(isZh
+                          ? `删除版本失败：${(e as Error).message || '请重试'}`
+                          : `Failed to delete version: ${(e as Error).message || 'please retry'}`);
+                      }
+                    }}
+                  >
+                    {resolveLang(uiSettings.language) === 'zh' ? '删除版本' : 'Delete'}
                   </button>
                 )}
                 <button
@@ -1850,7 +1997,7 @@ export function App() {
                 {selectedCompatibilityIssue.messages.map((message) => <li key={message}>{message}</li>)}
               </ul>
               <button type="button" className="btn btn-primary btn-sm" onClick={reclassifyViewedPlan} disabled={operationBusy}>
-                基于当前书签重新分类
+                {d.reclassifyCurrentBookmarks}
               </button>
             </div>
           )}
@@ -1861,14 +2008,16 @@ export function App() {
           )}
           {workspaceView === 'draft' && excludedBookmarks.length > 0 && (
             <div className="excluded-bookmarks" role="status">
-              <strong>未纳入本次方案：{excludedBookmarks.length} 条书签</strong>
-              <span>应用后这些书签会保留在当前 Chrome 位置，不会被删除或移动。</span>
+              <strong>{d.excludedBookmarksTitle(excludedBookmarks.length)}</strong>
+              <span>{d.excludedBookmarksNote}</span>
               <small>{excludedBookmarks.slice(0, 5).map((bookmark) => bookmark.title).join(' · ')}{excludedBookmarks.length > 5 ? ' · …' : ''}</small>
             </div>
           )}
 
           {workspaceView === 'draft' && viewedResult && !isHistoricalVersion && !running && !search.trim() && (
-            <div className="edit-hint">{d.editHint}</div>
+            savingDraft
+              ? <div className="edit-hint">{resolveLang(uiSettings.language) === 'zh' ? '正在保存方案修改…' : 'Saving plan changes…'}</div>
+              : <div className="edit-hint">{d.editHint}</div>
           )}
 
           <div className={`tree ${running ? "running" : ""}`}>
@@ -1882,7 +2031,7 @@ export function App() {
               <Tree
                 key={isHistoricalVersion
                   ? `history:${selectedHistoryVersionId}`
-                  : `${activeDraftKey}:${viewedResult.updatedAt ?? viewedResult.createdAt}`}
+                  : `draft:${activeDraftKey}`}
                 nodes={filteredTree}
                 bookmarkById={bookmarkById}
                 labels={viewedResult.labels}
@@ -1979,8 +2128,10 @@ export function App() {
                 </button>
               )}
               {hasBackup && (
-                <button type="button" className="btn btn-ghost btn-sm" onClick={downloadBackup}>
-                  {d.downloadBackup}
+                <button type="button" className="btn btn-ghost btn-sm" onClick={downloadBackup} disabled={backupDownloading}>
+                  {backupDownloading
+                    ? (resolveLang(uiSettings.language) === 'zh' ? '生成中…' : 'Preparing…')
+                    : d.downloadBackup}
                 </button>
               )}
             </div>
@@ -2092,6 +2243,64 @@ export function App() {
                 <div className="actions">
                   <button type="button" className="btn" onClick={closeEstimate}>{d.cancel}</button>
                   <button type="button" className="btn btn-primary" onClick={() => runClassify(estimate.scope)} disabled={classificationPending}>{d.startNow}</button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {showDataModal && (
+            <div className="modal-backdrop" onClick={() => { if (!dataBusy) closeDataModal(); }}>
+              <div ref={dataDialogRef} className="modal" role="dialog" aria-modal="true" aria-labelledby="dataDialogTitle" tabIndex={-1} onClick={(e) => e.stopPropagation()}>
+                <h3 id="dataDialogTitle">{resolveLang(uiSettings.language) === 'zh' ? '分类数据管理' : 'Classification data'}</h3>
+                <div className="modal-body">
+                  <p style={{ margin: '0 0 6px' }}>
+                    {resolveLang(uiSettings.language) === 'zh'
+                      ? '导出当前分类方案、标签缓存与设置（不含 API Key），用于备份或迁移到其他浏览器。'
+                      : 'Export the current plan, label cache and settings (API Key excluded) for backup or migration.'}
+                  </p>
+                  <small>
+                    {resolveLang(uiSettings.language) === 'zh'
+                      ? '导入时标签缓存按条目合并（导入项优先），分类方案整体替换，凭据字段保持本机不变。'
+                      : 'On import, cache entries are merged (import wins), the plan is replaced, and credentials stay local.'}
+                  </small>
+                  {dataError && <p className="modal-error" role="alert">{dataError}</p>}
+                  {dataSuccess && (
+                    <p className="modal-error" role="status" style={{ color: 'var(--ok, #34a853)' }}>{dataSuccess}</p>
+                  )}
+                  <div className="actions" style={{ marginTop: '10px' }}>
+                    <button
+                      type="button"
+                      className="btn"
+                      disabled={!!dataBusy || !!dataSuccess}
+                      onClick={() => void doExportData()}
+                    >
+                      {dataBusy === 'export'
+                        ? (resolveLang(uiSettings.language) === 'zh' ? '导出中…' : 'Exporting…')
+                        : (resolveLang(uiSettings.language) === 'zh' ? '导出数据' : 'Export')}
+                    </button>
+                    <button
+                      type="button"
+                      className="btn btn-primary"
+                      disabled={!!dataBusy || !!dataSuccess}
+                      onClick={() => dataImportInputRef.current?.click()}
+                    >
+                      {dataBusy === 'import'
+                        ? (resolveLang(uiSettings.language) === 'zh' ? '导入中…' : 'Importing…')
+                        : (resolveLang(uiSettings.language) === 'zh' ? '导入数据' : 'Import')}
+                    </button>
+                  </div>
+                  <input
+                    ref={dataImportInputRef}
+                    type="file"
+                    accept="application/json,.json"
+                    style={{ display: 'none' }}
+                    onChange={(event) => {
+                      const file = event.target.files?.[0];
+                      // 允许同一文件连续导入两次：不清空 value 的话第二次选择同一文件不触发 change。
+                      event.target.value = '';
+                      if (file) void doImportData(file);
+                    }}
+                  />
                 </div>
               </div>
             </div>

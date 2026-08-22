@@ -715,26 +715,34 @@ async function saveCheckResults({ status = lastResultStatus, source = lastResult
   const completed = resultStats.ok + resultStats.broken + resultStats.warning;
   lastResultStatus = status;
   lastResultSource = source;
-  await chrome.storage.local.set({
-    checkerLastResult: {
-      version: RESULT_VERSION,
-      timestamp: Date.now(),
-      source,
-      status,
-      counts: {
-        total: results.length,
-        completed,
-        pending: Math.max(0, results.length - completed),
-        normal: resultStats.ok,
-        confirmedMissing: resultStats.broken,
-        needsReview: resultStats.warning,
+  try {
+    await chrome.storage.local.set({
+      checkerLastResult: {
+        version: RESULT_VERSION,
+        timestamp: Date.now(),
+        source,
+        status,
+        counts: {
+          total: results.length,
+          completed,
+          pending: Math.max(0, results.length - completed),
+          normal: resultStats.ok,
+          confirmedMissing: resultStats.broken,
+          needsReview: resultStats.warning,
+        },
+        // 整条书签镜像含最长 8000 字的正文，写入 storage 会撑爆配额
+        // （后台定时检测同样只保留 id/title/url）。这里只落盘恢复结果所需字段。
+        results: results.map(({ bookmark, checkResult }) => ({
+          bookmark: { id: bookmark.id, title: bookmark.title, url: bookmark.url },
+          checkResult: { ...checkResult },
+        })),
       },
-      results: results.map(({ bookmark, checkResult }) => ({
-        bookmark: { ...bookmark },
-        checkResult: { ...checkResult },
-      })),
-    },
-  });
+    });
+  } catch (err) {
+    // 结果落盘失败不应吞掉检测完成/删除成功的提示——那会让用户误以为操作没生效。
+    console.error('保存检测结果失败:', err);
+    showToast(i18n('checkerSaveFailed'), 'error');
+  }
 }
 
 async function loadLastResults() {

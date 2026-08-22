@@ -45,6 +45,9 @@ globalThis.chrome = {
             incrementalQueue.push({ ...entry, attempts: 0, status: 'pending', nextAttemptAt: 0 });
           }
         }
+        return { success: true };
+      } else if (message.action === 'incrementalQueueEnqueueFail') {
+        return { success: false, error: 'queue_full' };
       } else if (message.action === 'incrementalQueueFail') {
         incrementalQueue = incrementalQueue.map((item) => message.ids.includes(item.id)
           ? { ...item, attempts: item.attempts + 1, status: 'retryable', lastError: message.error, nextAttemptAt: Date.now() + 1000 }
@@ -141,6 +144,14 @@ assert.match(classifier, /if\s*\(options\.persist\s*!==\s*false\)\s*await saveCl
 
 const queue = await importTypeScript('src/core/incrementalQueue.ts');
 await queue.enqueueIncrementalBookmarks([{ id: 'new-1', createdAt: 1 }]);
+// 入队失败必须上抛：静默吞掉会让调用方以为已排队（回归：此前不检查响应）。
+const originalSendMessage = globalThis.chrome.runtime.sendMessage;
+globalThis.chrome.runtime.sendMessage = async () => ({ success: false, error: 'queue_full' });
+await assert.rejects(
+  () => queue.enqueueIncrementalBookmarks([{ id: 'x', createdAt: 1 }]),
+  /queue_full/,
+);
+globalThis.chrome.runtime.sendMessage = originalSendMessage;
 assert.equal((await queue.loadIncrementalQueue()).length, 1);
 // 失败转移只走 port 租约（lease.fail 携带 ownerId），message 版已移除：后台的
 // failIncrementalClassificationQueue 强制要求 ownerId 匹配 running 项，无主调用恒为 no-op。

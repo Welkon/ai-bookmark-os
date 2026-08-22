@@ -15,7 +15,10 @@ assert.match(app, /历史版本为只读/, '历史版本必须明确以只读方
 assert.match(app, /inspectClassificationPlanCompatibility\(/, '回用方案前必须执行兼容性检查');
 assert.match(app, /unplannedBookmarkIds\.length/, '兼容确认框必须展示新增或未纳入方案的书签数');
 assert.match(app, /本次不调用 AI/, '兼容确认框必须说明回用不会调用 AI');
-assert.match(app, /基于当前书签重新分类/, '不兼容方案必须提供重新分类入口');
+// 文案已接入 i18n 字典（reclassifyCurrentBookmarks，9 语言齐全），不再硬编码中文。
+assert.match(app, /reclassifyViewedPlan[\s\S]{0,200}\{d\.reclassifyCurrentBookmarks\}/, '不兼容方案必须提供重新分类入口');
+const i18nSource = fs.readFileSync('src/core/i18n.ts', 'utf8');
+assert.equal((i18nSource.match(/reclassifyCurrentBookmarks:/g) || []).length, 9, 'reclassifyCurrentBookmarks must exist in all 9 languages');
 assert.match(app, /planVersionId:\s*appliedPlanVersionId/, '变更记录必须关联实际应用的方案版本');
 assert.match(app, /classificationPlanArchive/, '工作区必须监听历史版本存储变化');
 

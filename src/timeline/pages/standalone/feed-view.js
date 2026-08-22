@@ -908,9 +908,24 @@
     const newStarred = !feed.starred;
     try {
       await send('rssUpdateFeed', { feedId: feed.id, patch: { starred: newStarred } });
-      feed.starred = newStarred;
+      // 加星即置顶：源级星标此前只存状态、没有任何视图消费（按钮可点但无效果）。
+      // 通过持久化重排让加星源排到列表最前；显示顺序与存储顺序一致，不影响拖拽排序。
+      if (newStarred) {
+        const others = feeds.filter((f) => f.id !== feed.id);
+        const nextFeeds = [...others.filter((f) => f.starred), feed, ...others.filter((f) => !f.starred)];
+        feed.starred = true;
+        feeds = nextFeeds;
+        try {
+          await send('rssReorderFeeds', { orderedIds: feeds.map((f) => f.id) });
+        } catch (reorderErr) {
+          console.warn('[RSS] star reorder failed:', reorderErr);
+        }
+      } else {
+        feed.starred = false;
+      }
       toast(newStarred ? t('rssStarred') : t('rssUnstar'), 'success');
-      renderCurrentView();
+      renderFeedList();
+      if (currentView === 'all' || currentView === 'starred') renderCurrentView();
     } catch (err) {
       toast(t('rssSubscribeFailed'), 'error');
     }

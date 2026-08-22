@@ -3,6 +3,8 @@ import type { BookmarkTreeChange, BookmarkTreeChangeKind } from '../types';
 export type ChangeHistoryTreeNode = {
   name: string;
   path: string;
+  /** 稳定唯一键：同名兄弟目录按节点 ID 区分，避免被合并以及 React key 冲突。 */
+  key: string;
   changes: BookmarkTreeChange[];
   children: ChangeHistoryTreeNode[];
   count: number;
@@ -33,6 +35,7 @@ function finalizeNode(node: MutableChangeHistoryTreeNode): ChangeHistoryTreeNode
   return {
     name: node.name,
     path: node.path,
+    key: node.key,
     changes: node.changes,
     children,
     count: node.changes.length + children.reduce((total, child) => total + child.count, 0),
@@ -44,22 +47,33 @@ export function buildChangeHistoryTree(changes: BookmarkTreeChange[]): ChangeHis
   const root: MutableChangeHistoryTreeNode = {
     name: '',
     path: '',
+    key: '',
     changes: [],
     children: new Map(),
   };
 
   for (const change of changes) {
     const parts = changeFolderPath(change);
+    // Chrome 允许同一父目录下存在同名文件夹：叶子目录用节点 ID 区分实例，
+    // 否则两个同名目录的变更会被并进同一分支，且 path 字符串相同导致 React key 冲突。
+    const leafFolderId = change.nodeKind === 'folder' ? String(change.id || '') : '';
     let node = root;
-    for (const part of parts) {
-      const path = node.path ? `${node.path} / ${part}` : part;
-      let child = node.children.get(part);
+    parts.forEach((part, depth) => {
+      const isLeaf = depth === parts.length - 1;
+      const mapKey = isLeaf && leafFolderId ? `${part}#${leafFolderId}` : part;
+      let child = node.children.get(mapKey);
       if (!child) {
-        child = { name: part, path, changes: [], children: new Map() };
-        node.children.set(part, child);
+        child = {
+          name: part,
+          path: node.path ? `${node.path} / ${part}` : part,
+          key: node.key ? `${node.key} / ${mapKey}` : mapKey,
+          changes: [],
+          children: new Map(),
+        };
+        node.children.set(mapKey, child);
       }
       node = child;
-    }
+    });
     node.changes.push(change);
   }
 

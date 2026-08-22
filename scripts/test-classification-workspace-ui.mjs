@@ -15,7 +15,10 @@ assert.match(app, /const \[draftStatuses, setDraftStatuses\]/, 'every saved draf
 assert.match(app, /refreshDraftStatuses/, 'bookmark events must refresh the status of every saved draft');
 assert.match(app, /draftStatusLabel\(draftStatuses\[draft\.storageKey\]\)/, 'the saved draft picker must visibly label each draft state');
 assert.match(app, /const storageKey = activeDraftKeyRef[\s\S]{0,700}draftsRef\.current = nextDrafts[\s\S]{0,120}setDrafts\(nextDrafts\)/, 'editing the active draft must update its in-memory saved draft entry');
-assert.match(app, /`\$\{activeDraftKey\}:\$\{viewedResult\.updatedAt \?\? viewedResult\.createdAt\}`/, 'switching or editing a current draft must reset index-based batch selection state');
+// Tree 的 key 只随草稿切换变化：key 含 updatedAt 会让每次编辑（拖拽/重命名/批量移动）
+// 都整树重挂载，目录全部收起、勾选状态丢失。编辑间保持挂载，切换草稿/历史版本才重置。
+assert.match(app, /key=\{isHistoricalVersion\s*\?\s*`history:\$\{selectedHistoryVersionId\}`\s*:\s*`draft:\$\{activeDraftKey\}`\}/, 'tree remount must happen only when switching drafts or history versions, not on every edit');
+assert.doesNotMatch(app, /`\$\{activeDraftKey\}:\$\{viewedResult\.updatedAt/, 'tree key must not include updatedAt');
 assert.match(app, /refreshAfterBookmarkOperation/, 'apply and undo failures must reconcile the live bookmark tree after bookmark events are suppressed');
 assert.match(app, /excludedBookmarkIds/, 'bookmarks removed from a draft must remain visibly tracked as excluded');
 assert.match(tree, /onCreateCategory/, 'batch editing must support moving selected bookmarks into a new category');

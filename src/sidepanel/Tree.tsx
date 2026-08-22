@@ -343,7 +343,18 @@ function Folder({
       <div
         className={`folder-row ${folderDropIntent ? `drag-${folderDropIntent}` : ''}`}
         draggable={!!edit && !renaming}
+        role="button"
+        tabIndex={renaming ? -1 : 0}
+        aria-expanded={open}
         onClick={() => !renaming && setOpen(!open)}
+        onKeyDown={(event) => {
+          if (renaming) return;
+          // 键盘可达：目录展开此前只有鼠标一条路径，键盘用户无法到达嵌套书签。
+          if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault();
+            setOpen(!open);
+          }
+        }}
         onDragStart={(event) => {
           if (!edit || renaming) return;
           event.dataTransfer.effectAllowed = 'move';

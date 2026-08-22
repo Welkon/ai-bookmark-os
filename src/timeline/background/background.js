@@ -383,11 +383,14 @@ const TOMBSTONE_RETENTION_OPTIONS = [7, 15, 30, 60];
 // storage.local has no compare-and-swap. Serialize each logical resource so
 // concurrent bookmark events cannot commit stale arrays over user mutations.
 const storageMutationQueues = new Map();
+// 哨兵：mutation 返回它表示“数据未变化，跳过落盘”。undefined 语义是删除 key，不能复用。
+const NO_STORAGE_CHANGE = Symbol('no_storage_change');
 function mutateStorageResource(key, mutation) {
   const previous = storageMutationQueues.get(key) || Promise.resolve();
   const next = previous.catch(() => undefined).then(async () => {
     const data = await chrome.storage.local.get(key);
     const value = await mutation(data[key]);
+    if (value === NO_STORAGE_CHANGE) return data[key];
     if (value === undefined) await chrome.storage.local.remove(key);
     else await chrome.storage.local.set({ [key]: value });
     return value;
@@ -498,6 +501,17 @@ function consumeProgrammaticBookmarkMove(bookmarkId, parentId) {
   if (!entry) return false;
   programmaticBookmarkMoves.delete(key);
   return entry.expiresAt >= Date.now() && entry.parentId === String(parentId || '');
+}
+
+// 批量程序性移动（全量/局部分类应用、撤销、回滚）会在短时间内触发海量 onMoved。
+// 手工移动现在直接产生学习反馈，因此这类操作必须整体抑制学习，
+// 否则一次应用会把分类器自身的输出误学为"用户手工归档"意图。
+// 抑制带 10 分钟硬上限，防止调用方崩溃后永不恢复学习。
+const MOVE_LEARNING_SUPPRESSION_MAX_MS = 10 * 60 * 1000;
+let moveLearningSuppressedUntil = 0;
+
+function isMoveLearningSuppressed(now = Date.now()) {
+  return now < moveLearningSuppressedUntil;
 }
 
 function emptyRecommendationStore(now = Date.now()) {
@@ -1029,7 +1043,11 @@ async function resolveRecommendationReview(payload = {}) {
       await discardRecommendationReviewItem(review.id);
       return { success: true, decision };
     }
-    if (!snapshot) return { success: false, error: 'recommendation_not_found' };
+    // 快照已按 TTL 清理而复核项仍在（边界竞态）：视为过期，移除而非报错滞留。
+    if (!snapshot) {
+      await discardRecommendationReviewItem(review.id);
+      return { success: true, decision, staleDiscarded: true };
+    }
 
     if (review.type === 'move_observation') {
       if (decision !== 'accept') {
@@ -1037,14 +1055,20 @@ async function resolveRecommendationReview(payload = {}) {
         return { success: true, decision: 'ignore' };
       }
       const [nativeBookmark] = await chrome.bookmarks.get(review.bookmarkId).catch(() => []);
+      // 书签后续又被移动/改址：观察已过期。用户的手工归档优先，不产生学习反馈，
+      // 直接移除，避免"采用首选"永远报错且条目无法消除。
       if (!nativeBookmark?.url
         || recommendationUrlFingerprint(nativeBookmark.url) !== snapshot.urlFingerprint
         || nativeBookmark.parentId !== review.toFolderId) {
-        return { success: false, error: 'bookmark_changed' };
+        await discardRecommendationReviewItem(review.id);
+        return { success: true, decision, staleDiscarded: true };
       }
       const folderOptions = await loadBookmarkFolderOptions().catch(() => []);
       const targetFolder = folderOptions.find(item => item.id === nativeBookmark.parentId);
-      if (!targetFolder?.path) return { success: false, error: 'bookmark_changed' };
+      if (!targetFolder?.path) {
+        await discardRecommendationReviewItem(review.id);
+        return { success: true, decision, staleDiscarded: true };
+      }
       const feedback = await submitRecommendationFeedback({
         operationId: `${operationId}:feedback`,
         recommendationId: review.recommendationId,
@@ -1057,8 +1081,10 @@ async function resolveRecommendationReview(payload = {}) {
     }
 
     const [nativeBookmark] = await chrome.bookmarks.get(review.bookmarkId).catch(() => []);
+    // 书签被改址/删除：快照描述的已不是当前书签，无法产生有效反馈，直接过期移除。
     if (!nativeBookmark?.url || recommendationUrlFingerprint(nativeBookmark.url) !== snapshot.urlFingerprint) {
-      return { success: false, error: 'bookmark_changed' };
+      await discardRecommendationReviewItem(review.id);
+      return { success: true, decision, staleDiscarded: true };
     }
 
     if (decision === 'reject') {
@@ -1075,12 +1101,18 @@ async function resolveRecommendationReview(payload = {}) {
 
     const storedBookmarks = await getStoredBookmarks();
     const storedBookmark = storedBookmarks.find(item => item.id === review.bookmarkId);
-    if (!storedBookmark) return { success: false, error: 'bookmark_not_found' };
+    if (!storedBookmark) {
+      await discardRecommendationReviewItem(review.id);
+      return { success: true, decision, staleDiscarded: true };
+    }
     const currentTags = normalizeTagList(storedBookmark.tags || []);
     const sourceTags = normalizeTagList(review.sourceTags || []);
+    // 建议生成后用户已自行移动/整理该书签：手工结果优先（其移动已被自动学习），
+    // 不再套用旧建议，过期移除而非报错。
     if ((review.sourceParentId && nativeBookmark.parentId !== review.sourceParentId)
       || currentTags.join('\u0000').toLowerCase() !== sourceTags.join('\u0000').toLowerCase()) {
-      return { success: false, error: 'bookmark_changed' };
+      await discardRecommendationReviewItem(review.id);
+      return { success: true, decision, staleDiscarded: true };
     }
 
     const folderCandidate = snapshot.folders?.[0];
@@ -1090,7 +1122,8 @@ async function resolveRecommendationReview(payload = {}) {
       const folderOptions = await loadBookmarkFolderOptions().catch(() => []);
       targetFolder = folderOptions.find(item => item.id === folderCandidate.id) || null;
       if (!targetFolder || normalizeBookmarkFolderPath(targetFolder.path) !== normalizeBookmarkFolderPath(folderCandidate.folderPath)) {
-        return { success: false, error: 'folder_selection_mismatch' };
+        await discardRecommendationReviewItem(review.id);
+        return { success: true, decision, staleDiscarded: true };
       }
     }
     const recommendedTags = normalizeTagList(tagCandidate?.tag ? [tagCandidate.tag] : []);
@@ -1101,7 +1134,10 @@ async function resolveRecommendationReview(payload = {}) {
     const finalTagKeys = new Set(finalTags.map(tag => tag.toLowerCase()));
     const finalAutoTags = normalizeTagList([...(storedBookmark.tagsAuto || []), ...addedRecommendedTags])
       .filter(tag => finalTagKeys.has(tag.toLowerCase()));
-    if (!targetFolder && recommendedTags.length === 0) return { success: false, error: 'no_applicable_candidate' };
+    if (!targetFolder && recommendedTags.length === 0) {
+      await discardRecommendationReviewItem(review.id);
+      return { success: true, decision, staleDiscarded: true };
+    }
 
     let moved = false;
     try {
@@ -1591,8 +1627,12 @@ async function deleteHealthBookmarks(ids, operationId) {
     const requestedIds = [...new Set((ids || []).filter(Boolean))];
     const mirror = await getStoredBookmarks();
     const mirrorById = new Map(mirror.map((item) => [item.id, item]));
-    const records = [];
     const items = [];
+    // 先为所有可删除的书签构建撤销记录并在删除任何一条之前整体落盘：
+    // 否则“删除成功但撤销记录写入失败（如配额）”会让已删书签无法恢复。
+    // undo 对仍存在的书签会走 conflict 分支，因此个别条目最终删除失败也不会产生重复。
+    const pendingRecords = [];
+    const recordsById = new Map();
     for (const id of requestedIds) {
       try {
         const [node] = await chrome.bookmarks.get(id);
@@ -1608,18 +1648,45 @@ async function deleteHealthBookmarks(ids, operationId) {
           removedAt: Date.now(),
           existingDuplicateIds: duplicates.filter((item) => item.id !== id).map((item) => item.id),
         };
+        pendingRecords.push(record);
+        recordsById.set(id, record);
+      } catch (error) {
+        items.push({ id, status: 'failed', reason: error?.message || 'bookmark_delete_failed' });
+      }
+    }
+    if (pendingRecords.length) {
+      try {
+        await mutateStorageResource(STORAGE_KEY_HEALTH_UNDO, () => pendingRecords);
+      } catch (error) {
+        // 撤销记录无法持久化时不得继续删除，否则删除不可恢复。
+        return {
+          success: false,
+          operationId,
+          error: `undo_record_persist_failed: ${String(error?.message || error).slice(0, 160)}`,
+          ...makeBatchResult(items),
+        };
+      }
+    }
+    const removedRecords = [];
+    for (const id of requestedIds) {
+      const record = recordsById.get(id);
+      if (!record) continue; // 前置校验已失败的条目
+      try {
         await chrome.bookmarks.remove(id);
-        records.push(record);
+        removedRecords.push(record);
         items.push({ id, status: 'succeeded' });
         await addTombstone({ ...record, deletedFrom: 'health-check' });
       } catch (error) {
         items.push({ id, status: 'failed', reason: error?.message || 'bookmark_delete_failed' });
       }
     }
-    if (records.length) {
-      await mutateStorageResource(STORAGE_KEY_HEALTH_UNDO, () => records);
-      const removedIds = new Set(records.map((record) => record.id));
-      await mutateStoredBookmarks((bookmarks) => bookmarks.filter((item) => !removedIds.has(item.id)));
+    if (removedRecords.length) {
+      // 个别条目删除失败时收缩撤销记录，只保留真正删除的书签。
+      if (removedRecords.length !== pendingRecords.length) {
+        await mutateStorageResource(STORAGE_KEY_HEALTH_UNDO, () => removedRecords).catch(() => undefined);
+      }
+      const removedIds = new Set(removedRecords.map((record) => record.id));
+      await mutateStoredBookmarks((bookmarks) => bookmarks.filter((item) => !removedIds.has(item.id))).catch(() => undefined);
     }
     return { success: items.every((item) => item.status === 'succeeded'), operationId, ...makeBatchResult(items) };
   }));
@@ -2634,7 +2701,10 @@ async function failIncrementalClassificationQueue(ids, error, ownerId) {
   const affected = new Set(ids || []);
   const now = Date.now();
   return mutateIncrementalClassificationQueue((queue) => queue.map((item) => {
-    if (!affected.has(item.id) || item.status !== 'running' || item.ownerId !== ownerId) return item;
+    if (!affected.has(item.id)) return item;
+    // 与 complete 一致的宽容语义：未携带 ownerId 的调用仍可失败 running 项，
+    // 否则消息端漏传 ownerId 会让该 handler 永远 no-op，条目卡死在 running。
+    if (ownerId && (item.status !== 'running' || item.ownerId !== ownerId)) return item;
     const attempts = item.attempts + 1;
     const failed = attempts >= INCREMENTAL_MAX_ATTEMPTS;
     return clearIncrementalQueueLease(item, {
@@ -3881,18 +3951,19 @@ async function queueBookmarkMoveObservation(bookmark, fromFolderPath, toFolderId
     selectedFolderPath: normalizedTarget,
   };
   await persistRecommendationSnapshot(recommendation, bookmark);
-  return enqueueRecommendationReviewItem({
-    id: makeRecommendationId('move_review'),
-    type: 'move_observation',
-    bookmarkId: bookmark.id,
+  // 手工移动即最终事实：直接落一条 accepted 反馈供 domain→folder 规则学习，
+  // 不再进入人工复核队列（程序性移动已在 handleSingleBookmarkMoved 处过滤；
+  // 规则需 ≥2 个不同 URL 指纹才会激活，可防单次误移）。携带 bookmarkId 还会
+  // 顺带清掉该书签遗留的 bookmark_recommendation 待复核项——用户已亲自归档。
+  const feedback = await submitRecommendationFeedback({
+    operationId: makeRecommendationId('move_feedback'),
     recommendationId: recommendation.recommendationId,
-    title: bookmark.title || bookmark.url || '',
-    urlFingerprint: recommendationUrlFingerprint(bookmark.url),
-    fromFolderPath,
-    toFolderId,
-    toFolderPath: normalizedTarget,
-    confidence: 'high',
+    bookmarkId: bookmark.id,
+    outcome: 'accepted',
+    changedFields: [],
+    selection: { folderPath: normalizedTarget, tags: [] },
   });
+  return feedback?.success ? feedback : null;
 }
 
 async function reevaluateBookmarkRecommendations(ids, options = {}) {
@@ -5401,88 +5472,92 @@ async function ensureClickCountSourceMigration() {
 //   settings - FeedStore.getSettings() 返回的设置对象
 // 返回：{ success, bookmarkId?, error? }
 async function saveRssArticleAsBookmark(item, feed, settings) {
-  try {
-    if (!item || !item.link) return { success: false, error: 'no_url' };
-
-    // 1. 查重：同一 URL 已存在书签则跳过
+  // 查重与创建之间存在竞态窗口：后台并发轮询多个订阅源、或用户手动
+  // “存书签”与自动书签同时触发时，同 URL 会建出两份书签。按域串行化整个流程。
+  return runSerializedOperationDomain('rss-bookmark', async () => {
     try {
-      const existing = await chrome.bookmarks.search({ url: item.link });
-      if (existing && existing.length > 0) {
-        // 已存在书签，仅更新 item 的 bookmarkId 引用
-        if (feed) {
-          await FeedStore.setItemBookmark(item.id, feed.id, existing[0].id);
-        }
-        return { success: true, bookmarkId: existing[0].id, duplicated: true };
-      }
-    } catch { /* search 失败不阻塞，继续创建 */ }
+      if (!item || !item.link) return { success: false, error: 'no_url' };
 
-    // 2. 确定目标文件夹
-    let parentId = (feed && feed.folderId) || (settings && settings.defaultFolderId);
-    let folderName = '';
-    let folderPath = '';
-    if (!parentId) {
-      // 兜底：在书签栏创建 "RSS 收藏" 文件夹
-      const folder = await findOrCreateFolder('RSS 收藏');
-      if (folder) {
-        parentId = folder.id;
-        folderName = 'RSS 收藏';
-        folderPath = folder.path || '';
-      } else {
-        return { success: false, error: 'no_folder' };
-      }
-    } else {
-      // 读取文件夹名供智能标签使用
+      // 1. 查重：同一 URL 已存在书签则跳过
       try {
-        const parent = await chrome.bookmarks.get(parentId);
-        if (parent && parent[0]) folderName = parent[0].title || '';
-      } catch { /* 忽略 */ }
+        const existing = await chrome.bookmarks.search({ url: item.link });
+        if (existing && existing.length > 0) {
+          // 已存在书签，仅更新 item 的 bookmarkId 引用
+          if (feed) {
+            await FeedStore.setItemBookmark(item.id, feed.id, existing[0].id);
+          }
+          return { success: true, bookmarkId: existing[0].id, duplicated: true };
+        }
+      } catch { /* search 失败不阻塞，继续创建 */ }
+
+      // 2. 确定目标文件夹
+      let parentId = (feed && feed.folderId) || (settings && settings.defaultFolderId);
+      let folderName = '';
+      let folderPath = '';
+      if (!parentId) {
+        // 兜底：在书签栏创建 "RSS 收藏" 文件夹
+        const folder = await findOrCreateFolder('RSS 收藏');
+        if (folder) {
+          parentId = folder.id;
+          folderName = 'RSS 收藏';
+          folderPath = folder.path || '';
+        } else {
+          return { success: false, error: 'no_folder' };
+        }
+      } else {
+        // 读取文件夹名供智能标签使用
+        try {
+          const parent = await chrome.bookmarks.get(parentId);
+          if (parent && parent[0]) folderName = parent[0].title || '';
+        } catch { /* 忽略 */ }
+      }
+
+      // 3. 智能标签：复用统一异步推荐内核，证据不足时允许不打标签。
+      let tagNames = [];
+      const tempItem = {
+        url: item.link,
+        title: item.title || '',
+        domain: extractDomain(item.link),
+        folderName,
+        folderPath,
+        contentText: item.contentSnippet || item.summary || '',
+        metaDesc: item.summary || '',
+        excerpt: item.summary || ''
+      };
+      try {
+        const [recommended] = await recommendTagsForBookmarks([tempItem], 1);
+        tagNames = recommended?.tags || [];
+      } catch { /* 标签失败不阻塞保存 */ }
+
+      // 4. 通过 pendingQuickBookmarks 将标签和文件夹信息传递给 onCreated → addSingleBookmark
+      setPendingQuickBookmark(item.link, {
+        tags: tagNames,
+        folderName,
+        folderPath,
+        ruleTags: tagNames,
+        contentText: item.contentSnippet || item.summary || '',
+        metaDesc: item.summary || '',
+        excerpt: item.summary || ''
+      });
+
+      // 5. 创建书签（触发 onCreated → addSingleBookmark 消费 pending）
+      const bm = await chrome.bookmarks.create({
+        parentId,
+        title: item.title || item.link,
+        url: item.link
+      });
+
+      // 6. 更新文章的 bookmarkId 引用
+      if (feed) {
+        await FeedStore.setItemBookmark(item.id, feed.id, bm.id);
+      }
+
+      return { success: true, bookmarkId: bm.id, tags: tagNames };
+    } catch (err) {
+      console.error('[RSS] saveRssArticleAsBookmark failed:', err);
+      return { success: false, error: err.message };
     }
-
-    // 3. 智能标签：复用统一异步推荐内核，证据不足时允许不打标签。
-    let tagNames = [];
-    const tempItem = {
-      url: item.link,
-      title: item.title || '',
-      domain: extractDomain(item.link),
-      folderName,
-      folderPath,
-      contentText: item.contentSnippet || item.summary || '',
-      metaDesc: item.summary || '',
-      excerpt: item.summary || ''
-    };
-    try {
-      const [recommended] = await recommendTagsForBookmarks([tempItem], 1);
-      tagNames = recommended?.tags || [];
-    } catch { /* 标签失败不阻塞保存 */ }
-
-    // 4. 通过 pendingQuickBookmarks 将标签和文件夹信息传递给 onCreated → addSingleBookmark
-    setPendingQuickBookmark(item.link, {
-      tags: tagNames,
-      folderName,
-      folderPath,
-      ruleTags: tagNames,
-      contentText: item.contentSnippet || item.summary || '',
-      metaDesc: item.summary || '',
-      excerpt: item.summary || ''
-    });
-
-    // 5. 创建书签（触发 onCreated → addSingleBookmark 消费 pending）
-    const bm = await chrome.bookmarks.create({
-      parentId,
-      title: item.title || item.link,
-      url: item.link
-    });
-
-    // 6. 更新文章的 bookmarkId 引用
-    if (feed) {
-      await FeedStore.setItemBookmark(item.id, feed.id, bm.id);
-    }
-
-    return { success: true, bookmarkId: bm.id, tags: tagNames };
-  } catch (err) {
-    console.error('[RSS] saveRssArticleAsBookmark failed:', err);
-    return { success: false, error: err.message };
-  }
+  });
 }
 // 暴露到全局，供 feed-fetcher.js 自动书签功能调用
 self.saveRssArticleAsBookmark = saveRssArticleAsBookmark;
@@ -5588,9 +5663,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     case 'deleteBookmark':
       (async () => {
-        // 从 Chrome 书签中真正删除
+        // 从 Chrome 书签中真正删除。真实书签树是唯一事实来源：
+        // 镜像缺失（同步失败/延迟）时回退到 chrome.bookmarks.get，
+        // 不能让真实存在的书签永远删不掉。
         const bookmarks = await getStoredBookmarks();
-        const target = bookmarks.find((b) => b.id === message.id || (message.url && b.url === message.url));
+        let target = bookmarks.find((b) => b.id === message.id || (message.url && b.url === message.url));
+        if (!target && message.id) {
+          try {
+            const [node] = await chrome.bookmarks.get(message.id);
+            if (node?.url) target = { ...node };
+          } catch (_) { /* 节点不存在时保持 not found 语义 */ }
+        }
         if (!target || !message.id) {
           sendResponse({ success: false, error: 'Bookmark not found' });
           return;
@@ -5601,15 +5684,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           sendResponse({ success: false, error: err.message || 'bookmark_delete_failed' });
           return;
         }
-        /*
-        if (message.id) {
-          try {
-            await chrome.bookmarks.remove(message.id);
-          } catch (err) {
-            console.warn('删除 Chrome 书签失败:', err.message);
-          }
-        }
-        */
         let total = bookmarks.length;
         await mutateStoredBookmarks((current) => {
           const filtered = current.filter((item) => item.id !== message.id);
@@ -5881,7 +5955,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     case 'incrementalQueueFail':
       (async () => {
-        const queue = await failIncrementalClassificationQueue(message.ids || [], message.error);
+        const queue = await failIncrementalClassificationQueue(message.ids || [], message.error, message.ownerId);
         sendResponse({ success: true, queue });
       })();
       return true;
@@ -6559,6 +6633,29 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
 
     // ===== 主动学习（Active Learning）消息处理 =====
+    case 'setMoveLearningSuppression': {
+      // 分类应用/撤销等批量程序性移动期间暂停"手工移动自动学习"。
+      if (message.active === false) {
+        moveLearningSuppressedUntil = 0;
+      } else {
+        const durationMs = Math.min(
+          Math.max(0, Number(message.durationMs) || MOVE_LEARNING_SUPPRESSION_MAX_MS),
+          MOVE_LEARNING_SUPPRESSION_MAX_MS,
+        );
+        moveLearningSuppressedUntil = Date.now() + (durationMs > 0 ? durationMs : MOVE_LEARNING_SUPPRESSION_MAX_MS);
+      }
+      sendResponse({ success: true, active: isMoveLearningSuppressed() });
+      return false;
+    }
+
+    case 'markProgrammaticMove': {
+      const bookmarkId = String(message.bookmarkId || '').trim();
+      const parentId = String(message.parentId || '');
+      if (bookmarkId) markProgrammaticBookmarkMove(bookmarkId, parentId);
+      sendResponse({ success: true });
+      return false;
+    }
+
     case 'getReviewQueue': {
       (async () => {
         try {
@@ -6993,7 +7090,8 @@ chrome.bookmarks.onChanged.addListener((id, changeInfo) => {
   }).catch(() => {});
 });
 
-// 单个书签移动：更新镜像的 parentId/folderName/folderPath；来源不可信的移动进入待复核观察。
+// 单个书签移动：更新镜像的 parentId/folderName/folderPath；用户手工移动直接产生
+// accepted 学习反馈（自动学习 domain→folder 规则），程序性移动不参与学习。
 async function handleSingleBookmarkMoved(id, node, moveInfo) {
   const parent = await chrome.bookmarks.get(moveInfo.parentId);
   if (!parent || !parent[0]) return;
@@ -7014,7 +7112,7 @@ async function handleSingleBookmarkMoved(id, node, moveInfo) {
     chrome.runtime.sendMessage({ action: 'bookmarksUpdated', ids: [id] }).catch(() => {});
   }
 
-  if (updated && !consumeProgrammaticBookmarkMove(id, moveInfo.parentId)
+  if (updated && !isMoveLearningSuppressed() && !consumeProgrammaticBookmarkMove(id, moveInfo.parentId)
     && normalizeBookmarkFolderPath(previousFolderPath) !== normalizeBookmarkFolderPath(folderPath)) {
     await queueBookmarkMoveObservation({ ...node, id }, previousFolderPath, moveInfo.parentId, folderPath);
   }
@@ -7434,7 +7532,8 @@ chrome.runtime.onInstalled.addListener(() => {
   // 关闭所有已打开的独立窗口（插件重载后旧窗口上下文已失效）
   closeStandaloneWindows();
 
-  syncAllBookmarks();
+  // 同步失败只记录，不能以未处理 rejection 结束 SW 生命周期内的其他初始化。
+  syncAllBookmarks().catch((err) => console.error('启动同步失败(onInstalled):', err));
   scheduleCheckerAlarm();
   // 预加载智能标签缓存（使 autoTagBookmarkSync 可同步运行）
   if (typeof preloadSmartTaggerCaches === 'function') {
@@ -7586,28 +7685,39 @@ chrome.history.onVisited.addListener((historyItem) => {
   const visitCount = Math.max(0, Number(historyItem.visitCount) || 0);
   const lastClickedAt = Number(historyItem.lastVisitTime) || null;
   noteClickCountHistoryVisit(historyItem.url, visitCount, lastClickedAt);
-  return mutateStoredBookmarks((bookmarks) => bookmarks.map((item) => {
-    if (!item.url || normalizeClickCountUrl(item.url) !== normalizedUrl) return item;
-    if ((item.clickCount || 0) === visitCount && (item.lastClickedAt || null) === lastClickedAt) return item;
-    return { ...item, clickCount: visitCount, lastClickedAt };
-  })).catch(() => {});
+  // 大多数导航与书签无关：无匹配或数值未变时跳过整份镜像重写，
+  // 否则每开一个网页都会触发一次可能数 MB 的 get+set。
+  return mutateStoredBookmarks((bookmarks) => {
+    let changed = false;
+    const next = bookmarks.map((item) => {
+      if (!item.url || normalizeClickCountUrl(item.url) !== normalizedUrl) return item;
+      if ((item.clickCount || 0) === visitCount && (item.lastClickedAt || null) === lastClickedAt) return item;
+      changed = true;
+      return { ...item, clickCount: visitCount, lastClickedAt };
+    });
+    return changed ? next : NO_STORAGE_CHANGE;
+  }).catch(() => {});
 });
 
 chrome.history.onVisitRemoved.addListener((removed) => {
   if (!removed || (!removed.allHistory && !Array.isArray(removed.urls))) return;
   noteClickCountHistoryChange(removed.urls, removed.allHistory === true);
   if (removed.allHistory) {
-    return mutateStoredBookmarks((bookmarks) => bookmarks.map((item) => (
-      (item.clickCount || 0) === 0 && (item.lastClickedAt || null) === null
-        ? item
-        : { ...item, clickCount: 0, lastClickedAt: null }
-    ))).catch(() => {});
+    return mutateStoredBookmarks((bookmarks) => {
+      let changed = false;
+      const next = bookmarks.map((item) => {
+        if ((item.clickCount || 0) === 0 && (item.lastClickedAt || null) === null) return item;
+        changed = true;
+        return { ...item, clickCount: 0, lastClickedAt: null };
+      });
+      return changed ? next : NO_STORAGE_CHANGE;
+    }).catch(() => {});
   }
   return refreshStoredClickCountsForUrls(removed.urls).catch(() => {});
 });
 
 chrome.runtime.onStartup.addListener(() => {
-  syncAllBookmarks();
+  syncAllBookmarks().catch((err) => console.error('启动同步失败(onStartup):', err));
   scheduleCheckerAlarm();
   // 预加载智能标签缓存（使 autoTagBookmarkSync 可同步运行）
   if (typeof preloadSmartTaggerCaches === 'function') {

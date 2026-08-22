@@ -946,8 +946,11 @@ zoomOutBtn.addEventListener('click', () => {
 });
 
 resetViewBtn.addEventListener('click', () => {
-  if (cy) { cy.fit(undefined, 40); }
-  zoomLevelEl.textContent = '100%';
+  // fit 后的实际缩放几乎不会恰好是 100%：回填真实值，避免标签与视图不符。
+  if (cy) {
+    cy.fit(undefined, 40);
+    zoomLevelEl.textContent = Math.round(cy.zoom() * 100) + '%';
+  }
 });
 
 reLayoutBtn.addEventListener('click', () => {
@@ -1199,7 +1202,8 @@ async function loadData() {
 
     graphLoading.style.display = 'none';
     await rebuild();
-    zoomLevelEl.textContent = '100%';
+    // 初始布局后的实际缩放几乎不会恰好是 100%：回填真实值，避免标签与视图不符。
+    zoomLevelEl.textContent = cy ? Math.round(cy.zoom() * 100) + '%' : '100%';
   } catch (err) {
     console.error('加载图谱数据失败:', err);
     graphLoading.style.display = 'none';

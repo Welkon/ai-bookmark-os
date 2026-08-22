@@ -22,6 +22,17 @@ async function getAILogs(limit = 100) {
   }
 }
 
+// 串行化日志读改写：同一次分类的 trigger/classify_* 等日志会并发写入，
+// 此前 get→push→set 无队列，后写者会覆盖先写者导致丢条。单 key 用一条链即可。
+let logWriteChain = Promise.resolve();
+
+function enqueueLogWrite(task) {
+  const run = logWriteChain.then(task, task);
+  // 链上吞掉错误：一次失败不能让后续日志写入全部短路。
+  logWriteChain = run.then(() => undefined, () => undefined);
+  return run;
+}
+
 async function logAIEvent(event) {
   try {
     if (!event || !event.type) return null;
@@ -38,14 +49,16 @@ async function logAIEvent(event) {
       details: event.details || {}
     };
 
-    const data = await chrome.storage.local.get(AI_LOGS_KEY);
-    const logs = data[AI_LOGS_KEY] || [];
-    logs.push(entry);
-    if (logs.length > AI_MAX_LOGS) {
-      logs.splice(0, logs.length - AI_MAX_LOGS);
-    }
-    await chrome.storage.local.set({ [AI_LOGS_KEY]: logs });
-    notifyAILogUpdate();
+    await enqueueLogWrite(async () => {
+      const data = await chrome.storage.local.get(AI_LOGS_KEY);
+      const logs = data[AI_LOGS_KEY] || [];
+      logs.push(entry);
+      if (logs.length > AI_MAX_LOGS) {
+        logs.splice(0, logs.length - AI_MAX_LOGS);
+      }
+      await chrome.storage.local.set({ [AI_LOGS_KEY]: logs });
+      notifyAILogUpdate();
+    });
     return entry;
   } catch (e) {
     console.warn('AI log failed:', e);

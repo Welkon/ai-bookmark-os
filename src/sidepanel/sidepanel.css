@@ -553,6 +553,12 @@ button:not(.icon-btn):not(.btn):not(.search-clear):not(.pill):not(.nav-item):not
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 35%, transparent);
 }
 
+.folder-row:focus-visible,
+.bookmark-row:focus-within {
+  outline: 2px solid color-mix(in srgb, var(--accent) 55%, transparent);
+  outline-offset: -2px;
+}
+
 .folder-row.drag-before {
   box-shadow: inset 0 2px 0 var(--accent);
 }

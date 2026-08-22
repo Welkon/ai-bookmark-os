@@ -149,7 +149,9 @@ export function isIncrementalQueueNearLimit(queue: IncrementalQueueEntry[]): boo
 }
 
 export async function enqueueIncrementalBookmarks(entries: Array<Pick<IncrementalQueueEntry, 'id' | 'createdAt'>>): Promise<void> {
-  await chrome.runtime.sendMessage({ action: 'incrementalQueueEnqueue', entries });
+  const response = await chrome.runtime.sendMessage({ action: 'incrementalQueueEnqueue', entries }) as { success?: boolean; error?: string } | undefined;
+  // 后台入队失败（队列满/存储异常）必须上抛，静默吞掉会让调用方以为已排队。
+  if (!response?.success) throw new Error(response?.error || 'incremental_queue_enqueue_failed');
 }
 
 export async function markIncrementalQueueFailed(ids: string[], error: string): Promise<IncrementalQueueEntry[]> {

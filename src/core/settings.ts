@@ -56,8 +56,15 @@ function migrateDefaultPrompts(prompts?: Partial<ClassifyPrompts>): ClassifyProm
 export async function loadSettings(): Promise<Settings> {
   const data = await chrome.storage.local.get('settings');
   if (data.settings) {
-    const merged = { ...DEFAULT_SETTINGS, ...data.settings } as Settings;
+    let merged = { ...DEFAULT_SETTINGS, ...data.settings } as Settings;
     merged.classifyPrompts = migrateDefaultPrompts(data.settings.classifyPrompts || {});
+    // 读取路径同样自愈：storage 被外部损坏（非法枚举/类型）时回退默认值，
+    // 避免坏配置让分类流程持续抛错且重启后依旧损坏。
+    try {
+      merged = validateSettings(merged);
+    } catch {
+      merged = { ...DEFAULT_SETTINGS };
+    }
     await cleanLegacySyncSettings(merged);
     return merged;
   }
@@ -71,6 +78,7 @@ export async function loadSettings(): Promise<Settings> {
         apiKey: '',
         classifyPrompts: { ...DEFAULT_CLASSIFY_PROMPTS },
         preservedFolderIds: [],
+        preservedFolderPaths: [],
       } as Settings;
       await chrome.storage.local.set({ settings: restored });
       await cleanLegacySyncSettings(restored);

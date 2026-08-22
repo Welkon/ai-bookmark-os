@@ -32,7 +32,7 @@ function ChangeHistoryBranch({ node, depth }: { node: ChangeHistoryTreeNode; dep
       </summary>
       <div className="change-history-tree__children">
         <ChangeItems changes={node.changes} />
-        {node.children.map((child) => <ChangeHistoryBranch key={child.path} node={child} depth={depth + 1} />)}
+        {node.children.map((child) => <ChangeHistoryBranch key={child.key} node={child} depth={depth + 1} />)}
       </div>
     </details>
   );
@@ -43,7 +43,7 @@ export function ChangeHistoryTree({ changes }: { changes: BookmarkTreeChange[] }
   return (
     <div className="change-history-tree" aria-label="书签变更目录树">
       <ChangeItems changes={tree.changes} />
-      {tree.children.map((node) => <ChangeHistoryBranch key={node.path} node={node} depth={0} />)}
+      {tree.children.map((node) => <ChangeHistoryBranch key={node.key} node={node} depth={0} />)}
     </div>
   );
 }

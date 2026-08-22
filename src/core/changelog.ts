@@ -9,6 +9,30 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: '1.0.9',
+    zh: [
+      '时间线体验修复：日期分组、搜索渲染与分页纠正',
+      '书签同步进度展示与快照竞态防护',
+    ],
+    en: [
+      'Timeline fixes: date grouping, search rendering and paging',
+      'Bookmark sync progress and snapshot race protection',
+    ],
+  },
+  {
+    version: '1.0.7',
+    zh: [
+      'AI 分类容错与导入安全性加固',
+      '主动学习记录分页与审核流程改进',
+      '书签工作流与导航界面稳定性修复',
+    ],
+    en: [
+      'Hardened AI classification fault tolerance and import security',
+      'Active learning records pagination and review improvements',
+      'Bookmark workflow and navigation UI stability fixes',
+    ],
+  },
+  {
     version: '0.5.1',
     zh: [
       'Chrome 应用商店支持多语言展示：新增 _locales 元数据',
@@ -85,4 +109,21 @@ export function entriesSince(prevVersion: string, currentVersion: string): Chang
     return 0;
   };
   return CHANGELOG.filter((e) => cmp(e.version, prevVersion) > 0 && cmp(e.version, currentVersion) <= 0);
+}
+
+/**
+ * 计算升级后应展示的「新版本内容」条目。
+ * CHANGELOG 未维护到目标版本时（如 0.5.1 之后长期未追加条目），只要确实
+ * 发生了版本变化就退回一条通用提示，避免更新弹窗被静默吞掉；
+ * 版本未变化则返回空数组（调用方据此清除 pendingWhatsNew）。
+ */
+export function resolveWhatsNewEntries(prevVersion: string, currentVersion: string): ChangelogEntry[] {
+  const entries = entriesSince(prevVersion, currentVersion);
+  if (entries.length > 0) return entries;
+  if (prevVersion === currentVersion) return [];
+  return [{
+    version: currentVersion,
+    zh: ['版本已更新，包含稳定性修复与体验优化。'],
+    en: ['Updated with stability fixes and experience improvements.'],
+  }];
 }

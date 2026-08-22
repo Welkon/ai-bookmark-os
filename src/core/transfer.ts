@@ -93,12 +93,21 @@ export async function importBundle(json: string): Promise<ImportResult> {
   if (normalizedCache === null) throw new Error('INVALID_BUNDLE');
   const normalizedResult = normalizeImportedClassifyResult(bundle.classifyResult);
 
-  const existing = await chrome.storage.local.get(['labelCache']);
-  const mergedCache = { ...(existing.labelCache ?? {}), ...normalizedCache };
+  // 标签缓存必须经后台单写者合并（labelCacheMerge）：绕开它直写 storage 会
+  // 跳过 TTL/条数/字节上限，并与进行中的分类缓存写互相覆盖丢更新。
+  const entries = Object.entries(normalizedCache);
+  const CHUNK = 200;
+  for (let offset = 0; offset < entries.length; offset += CHUNK) {
+    const response = await chrome.runtime.sendMessage({
+      action: 'labelCacheMerge',
+      cacheEntries: entries.slice(offset, offset + CHUNK),
+    }) as { success?: boolean; error?: string };
+    if (!response?.success) throw new Error(response?.error || 'label_cache_write_failed');
+  }
 
-  const writes: Record<string, unknown> = { labelCache: mergedCache };
+  const writes: Record<string, unknown> = {};
   if (normalizedResult) writes.classifyResult = normalizedResult;
-  await chrome.storage.local.set(writes);
+  if (Object.keys(writes).length) await chrome.storage.local.set(writes);
 
   // 设置合并：仅接受对象类型，保留本机凭据字段；validateSettings 做范围/枚举校验。
   // apiKey 与端点字段（baseUrl/customFullUrl/customApiStyle）是一组配对凭据：

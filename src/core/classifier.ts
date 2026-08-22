@@ -10,7 +10,7 @@ import type {
 } from '../types';
 import { chat, extractJson, getAiRequestTimeoutMs, getAiRetryCount } from './llm';
 import { resolveClassifyPrompts } from '../types';
-import { hashUrl, loadCache, saveCache, type CachedPageContext } from './cache';
+import { hashUrl, loadCache, saveCache, type CachedLabel, type CachedPageContext } from './cache';
 import { collectPlannedBookmarkIds } from './bookmarks';
 
 /** 调用 LLM 并解析 JSON；失败时追加“只输出 JSON”修复提示重试一次 */
@@ -512,8 +512,26 @@ async function labelBookmarks(
   onProgress: ProgressFn,
   signal: AbortSignal,
 ): Promise<{ labels: Record<string, BookmarkLabel>; responses: string[]; contexts: Map<string, PageContext> }> {
-  const cacheEnabled = useClassificationCache(settings);
-  const cache = cacheEnabled ? await loadCache() : {};
+  // 缓存只是加速数据：读失败降级为空缓存，写失败停用本轮缓存，
+  // 都不允许让已经完成的打标批次作废（否则一次 storage 抖动会丢掉整次分类）。
+  const cacheWanted = useClassificationCache(settings);
+  let cacheActive = cacheWanted;
+  let cache: Record<string, CachedLabel> = {};
+  if (cacheWanted) {
+    try {
+      cache = await loadCache();
+    } catch {
+      cacheActive = false;
+    }
+  }
+  const persistCache = async () => {
+    if (!cacheActive) return;
+    try {
+      await saveCache(cache);
+    } catch {
+      cacheActive = false;
+    }
+  };
   const labels: Record<string, BookmarkLabel> = {};
   const responses: string[] = [];
   const pending: FlatBookmark[] = [];
@@ -522,7 +540,7 @@ async function labelBookmarks(
 
   for (const b of bookmarks) {
     const cached = cache[classificationCacheKey(b, settings)];
-    if (cacheEnabled && cached && cached.sourceUrl === normalizedUrl(b.url)) {
+    if (cacheActive && cached && cached.sourceUrl === normalizedUrl(b.url)) {
       labels[b.id] = { id: b.id, summary: cached.summary, tags: cached.tags };
       if (cached.pageContext) contexts.set(b.id, cached.pageContext);
       else contextPending.push(b);
@@ -548,7 +566,7 @@ async function labelBookmarks(
     });
     let cacheChanged = false;
     for (const [id, context] of fetchedContexts) contexts.set(id, context);
-    if (cacheEnabled) {
+    if (cacheActive) {
       for (const bookmark of contextPending) {
         const context = fetchedContexts.get(bookmark.id);
         const cached = cache[classificationCacheKey(bookmark, settings)];
@@ -557,7 +575,7 @@ async function labelBookmarks(
           cacheChanged = true;
         }
       }
-      if (cacheChanged) await saveCache(cache);
+      if (cacheChanged) await persistCache();
     }
   }
 
@@ -667,7 +685,7 @@ async function labelBookmarks(
         tags: Array.isArray(item.tags) ? item.tags.map(String).slice(0, 3) : [],
       };
       labels[bm.id] = label;
-      if (cacheEnabled) {
+      if (cacheActive) {
         cache[classificationCacheKey(bm, settings)] = {
           sourceUrl: normalizedUrl(bm.url),
           summary: label.summary,
@@ -685,7 +703,7 @@ async function labelBookmarks(
       }
     }
     done += batch.length;
-    if (cacheEnabled) await saveCache(cache);
+    await persistCache();
     if (!signal.aborted) onProgress({ phase: 'labeling', done, total, message: undefined });
   };
 
@@ -1165,7 +1183,15 @@ export async function estimateClassify(
   settings?: Settings,
 ): Promise<ClassifyEstimate> {
   const cacheEnabled = settings ? useClassificationCache(settings) : true;
-  const cache = cacheEnabled ? await loadCache() : {};
+  // 预估同样不能被缓存读取失败阻断：读不到就按“全部未缓存”估算。
+  let cache: Awaited<ReturnType<typeof loadCache>> = {};
+  if (cacheEnabled) {
+    try {
+      cache = await loadCache();
+    } catch {
+      cache = {};
+    }
+  }
   const preservedPaths = settings ? await resolvePreservedFolderPaths(settings) : new Set<string>();
   const flexible = settings
     ? bookmarks.filter((bookmark) => !isInPreservedFolder(bookmark, preservedPaths))

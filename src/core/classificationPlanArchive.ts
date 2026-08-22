@@ -351,6 +351,18 @@ export async function toggleClassificationPlanVersionPin(versionId: string): Pro
   const target = archive.versions.find((v) => v.versionId === normalizedId);
   if (!target) throw new Error(`未找到版本：${normalizedId}`);
   const nextPinned = !target.pinned;
+  if (!nextPinned) {
+    // 取消星标后该版本回到轮换池：若会因超出保留上限被自动淘汰，等价于
+    // “取消星标 = 静默删除”，与“星标版本只能手动删除”的设计冲突。
+    // 拒绝操作并抛出机器可读错误码，由 UI 提示改用显式删除。
+    const unpinned = orderVersions([
+      ...archive.versions.filter((v) => !v.pinned && v.versionId !== normalizedId),
+      { ...target, pinned: false },
+    ]).filter((v) => !v.pinned);
+    if (unpinned.findIndex((v) => v.versionId === normalizedId) >= MAX_CLASSIFICATION_PLAN_VERSIONS) {
+      throw new Error('UNPIN_WOULD_EVICT_VERSION');
+    }
+  }
   const next = normalizeArchive({
     version: 1,
     versions: archive.versions.map((v) =>

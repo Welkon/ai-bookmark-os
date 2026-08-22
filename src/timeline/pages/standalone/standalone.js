@@ -383,7 +383,8 @@ function getDateGroupLabel(timestamp) {
   const date = new Date(timestamp);
   const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
   const target = new Date(date.getFullYear(), date.getMonth(), date.getDate());
-  const diffDays = Math.floor((today - target) / (1000 * 60 * 60 * 24));
+  // 两个本地午夜差在夏令时切换日是 23h/25h：floor 会把“昨天”误判为“今天”，用 round。
+  const diffDays = Math.round((today - target) / (1000 * 60 * 60 * 24));
 
   if (diffDays === 0) return i18n('today');
   if (diffDays === 1) return i18n('yesterday');
@@ -1801,12 +1802,11 @@ let currentTheme = 'system';
 
 function loadTheme() {
   chrome.storage.local.get('theme', (data) => {
-    let theme = data.theme || 'light';
-    // 如果存储的是 'system'（旧版），根据系统偏好决定
-    if (theme === 'system') {
-      theme = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
-    }
-    applyTheme(theme);
+    // 与 popup/checker 语义一致：system 不在 JS 里解析成 light/dark，
+    // 去掉主题类交给 CSS prefers-color-scheme——此前这里把 system 一次性解析成
+    // 固定值（且未设置时默认 light），系统深浅色切换后独立窗口不再跟随，
+    // 与弹窗主题不一致。
+    applyTheme(data.theme || 'system');
   });
 }
 

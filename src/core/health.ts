@@ -12,11 +12,30 @@ const DEAD_CHECK_CONCURRENCY = 5;
 /** 同一根域名最大并发探测数，避免触发目标站限流 */
 const PER_DOMAIN_CONCURRENCY = 2;
 
+/**
+ * 常见二级公共后缀与 PaaS 共享子域。它们的“最后两段”不是注册域：
+ * 简单取后两段会让所有 co.uk / github.io / blogspot.com 站点挤进同一个
+ * 并发槽（每槽 2），这类站点多时死链检测近乎串行。命中时多取一段。
+ */
+const MULTIPART_PUBLIC_SUFFIXES = new Set([
+  'co.uk', 'org.uk', 'ac.uk', 'gov.uk', 'me.uk', 'net.uk', 'sch.uk',
+  'com.cn', 'net.cn', 'org.cn', 'gov.cn', 'edu.cn', 'ac.cn',
+  'com.au', 'net.au', 'org.au', 'com.br', 'com.mx', 'com.tr',
+  'co.jp', 'or.jp', 'ne.jp', 'co.kr', 'co.in', 'co.nz', 'co.za',
+  'github.io', 'gitlab.io', 'pages.dev', 'vercel.app', 'netlify.app',
+  'blogspot.com', 'wordpress.com', 'medium.com', 'notion.site',
+  'firebaseapp.com', 'web.app',
+]);
+
 /** 提取根域名（用于限流分组） */
-function rootDomain(url: string): string {
+export function rootDomain(url: string): string {
   try {
     const { hostname } = new URL(url);
     const parts = hostname.split('.');
+    if (parts.length >= 3) {
+      const lastTwo = parts.slice(-2).join('.');
+      if (MULTIPART_PUBLIC_SUFFIXES.has(lastTwo)) return parts.slice(-3).join('.');
+    }
     return parts.slice(-2).join('.');
   } catch {
     return url;
