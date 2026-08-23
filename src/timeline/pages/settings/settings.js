@@ -1133,10 +1133,12 @@ async function clearAILogsUI() {
   }
 }
 
+// innerHTML 只转义 & < >，不转义引号。本函数被大量用于属性上下文
+// （如 value="${escapeHtml(...)}"），外部内容里的裸引号会闭合属性并注入事件处理器。
 function escapeHtml(text) {
   const div = document.createElement('div');
   div.textContent = text == null ? '' : String(text);
-  return div.innerHTML;
+  return div.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
 function openExtensionPage(path) {

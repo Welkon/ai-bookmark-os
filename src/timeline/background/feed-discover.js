@@ -43,7 +43,14 @@
         world: 'ISOLATED'
       });
       return (result && result.result) || [];
-    } catch {
+    } catch (error) {
+      // 未授予站点权限时 executeScript 会抛"Cannot access contents of the page"。
+      // 此前一律吞成 []，用户看到的是"未发现可订阅的 RSS 源"，无法得知真实原因是缺权限，
+      // 也不会被引导去授权。此类错误必须上抛，由调用方给出可行动提示。
+      const message = String(error?.message || '');
+      if (/cannot access|host permission|permission|extension manifest/i.test(message)) {
+        throw new Error('rss_discover_permission_denied');
+      }
       return [];
     }
   }

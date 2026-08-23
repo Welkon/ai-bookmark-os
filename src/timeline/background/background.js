@@ -7092,7 +7092,10 @@ chrome.bookmarks.onChanged.addListener((id, changeInfo) => {
 
 // 单个书签移动：更新镜像的 parentId/folderName/folderPath；用户手工移动直接产生
 // accepted 学习反馈（自动学习 domain→folder 规则），程序性移动不参与学习。
-async function handleSingleBookmarkMoved(id, node, moveInfo) {
+// options.suppressedAtEvent / options.programmaticAtEvent 由 onMoved 监听器在事件到达时
+// 同步捕获（见该处注释）：批量移动的事件可能在抑制窗口结束、或程序性标记的有效期过后
+// 才排到队列，只看出队时刻的状态会漏判，把程序性移动误学成用户手工归档。
+async function handleSingleBookmarkMoved(id, node, moveInfo, options = {}) {
   const parent = await chrome.bookmarks.get(moveInfo.parentId);
   if (!parent || !parent[0]) return;
   const parentTitle = parent[0].title || '';
@@ -7112,7 +7115,14 @@ async function handleSingleBookmarkMoved(id, node, moveInfo) {
     chrome.runtime.sendMessage({ action: 'bookmarksUpdated', ids: [id] }).catch(() => {});
   }
 
-  if (updated && !isMoveLearningSuppressed() && !consumeProgrammaticBookmarkMove(id, moveInfo.parentId)
+  // 抑制判定取"事件到达时"与"当前"的并集：前者覆盖批量移动事件积压到窗口结束后才处理的情况，
+  // 后者覆盖 handleSingleBookmarkMoved 被直接调用（无事件上下文）时的场景。
+  const suppressed = options.suppressedAtEvent === true || isMoveLearningSuppressed();
+  // 程序性标记同理：监听器已在事件到达时消费过标记，此处直接采信其结论，
+  // 不再重复消费（标记带 30 秒有效期，出队晚于有效期会判为"已过期"而漏判）。
+  const programmatic = options.programmaticAtEvent === true
+    || (options.programmaticAtEvent === undefined && consumeProgrammaticBookmarkMove(id, moveInfo.parentId));
+  if (updated && !suppressed && !programmatic
     && normalizeBookmarkFolderPath(previousFolderPath) !== normalizeBookmarkFolderPath(folderPath)) {
     await queueBookmarkMoveObservation({ ...node, id }, previousFolderPath, moveInfo.parentId, folderPath);
   }
@@ -7160,12 +7170,19 @@ async function handleFolderMoved(folderId) {
 
 // 监听书签移动：单个书签与文件夹分别处理。
 chrome.bookmarks.onMoved.addListener((id, moveInfo) => {
+  // 抑制状态与程序性标记都必须在事件到达时同步判定：批量应用会瞬间产生海量 onMoved，
+  // 它们在串行队列里逐个 await（每条都要 bookmarks.get + loadBookmarkFolderOptions + 镜像写入），
+  // 出队处理很可能已经晚于 core 侧 finally 里的"恢复学习"消息、或晚于单条标记的 30 秒有效期，
+  // 此时再判定就会把分类器自己的移动误学成用户手工归档。
+  // 标记按书签 id 记录，文件夹移动事件查不到条目、返回 false，不会误消费。
+  const suppressedAtEvent = isMoveLearningSuppressed();
+  const programmaticAtEvent = consumeProgrammaticBookmarkMove(id, moveInfo.parentId);
   bookmarkMoveUpdateQueue = bookmarkMoveUpdateQueue.then(async () => {
     try {
       const bookmark = await chrome.bookmarks.get(id);
       if (!bookmark || !bookmark[0]) return;
       if (bookmark[0].url) {
-        await handleSingleBookmarkMoved(id, bookmark[0], moveInfo);
+        await handleSingleBookmarkMoved(id, bookmark[0], moveInfo, { suppressedAtEvent, programmaticAtEvent });
       } else {
         await handleFolderMoved(id);
       }
@@ -7625,6 +7642,15 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
       });
     } catch (err) {
       console.error('右键订阅失败:', err);
+      // 缺站点权限时 discoverInTab 会上抛，给出可行动提示而不是静默失败
+      chrome.notifications?.create({
+        type: 'basic',
+        iconUrl: '../icons/icon48.png',
+        title: 'AI Bookmark OS',
+        message: err?.message === 'rss_discover_permission_denied'
+          ? '无法读取当前页面：请先授予该站点访问权限后重试'
+          : '订阅失败: ' + (err?.message || 'unknown'),
+      });
     }
     return;
   }

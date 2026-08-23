@@ -74,9 +74,13 @@ async function notifyAILogUpdate() {
   }
 }
 
+// 清空必须走同一条写入链：否则在飞的 logAIEvent（已完成 get、正在 await set）
+// 会在 remove 之后把旧数组连同新条目写回，UI 已提示"已清空"但日志全部复活。
 async function clearAILogs() {
   try {
-    await chrome.storage.local.remove(AI_LOGS_KEY);
+    await enqueueLogWrite(async () => {
+      await chrome.storage.local.remove(AI_LOGS_KEY);
+    });
     return true;
   } catch (e) {
     return false;

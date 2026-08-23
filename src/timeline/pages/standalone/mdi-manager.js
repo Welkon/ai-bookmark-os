@@ -34,10 +34,12 @@
     return key;
   }
 
+  // innerHTML 只转义 & < >，不转义引号。本函数被用于属性上下文
+  // （如 title="${escapeHtml(...)}"），标题等外部内容里的裸引号会闭合属性。
   function escapeHtml(str) {
     const d = document.createElement('div');
-    d.textContent = str;
-    return d.innerHTML;
+    d.textContent = str == null ? '' : String(str);
+    return d.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   }
 
   // 图片加载失败的兜底处理（事件委托，捕获阶段——error 事件不冒泡）。

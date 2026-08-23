@@ -120,7 +120,13 @@
 
   function _isPrivateOrLocalHost(hostname) {
     const host = String(hostname || '').toLowerCase().replace(/^\[|\]$/g, '');
-    if (!host || host === 'localhost' || host.endsWith('.localhost') || host === '::1' || host.startsWith('fe80:') || host.startsWith('fc') || host.startsWith('fd')) return true;
+    if (!host || host === 'localhost' || host.endsWith('.localhost') || host === '::1') return true;
+    // IPv6 链路本地（fe80::/10）与唯一本地地址（fc00::/7）。前缀判断必须限定在
+    // IPv6 字面量内：否则 fcbarcelona.com / fdroid.org / fc2.com 这类公网域名
+    // 会被误判为私有地址，代理回退被静默禁用且用户看不到原因。
+    if (host.includes(':')) {
+      if (host.startsWith('fe80:') || host.startsWith('fc') || host.startsWith('fd')) return true;
+    }
     const parts = host.split('.');
     if (parts.length !== 4 || parts.some(part => !/^\d+$/.test(part))) return false;
     const nums = parts.map(Number);
@@ -312,9 +318,10 @@
           if (fav) patch.favicon = fav;
         } catch { /* ignore */ }
       }
-      await FeedStore.updateFeed(feed.id, patch);
-
+      // 必须先落条目再提交 etag/lastModified：反序会留下"已记 etag 但文章没写进去"的半写状态，
+      // 下一轮带 If-None-Match 请求拿到 304 就直接标记成功返回，这批文章永远不会再被写入。
       const added = await FeedStore.upsertItems(feed.id, parsed.items, settings.maxItemsPerFeed);
+      await FeedStore.updateFeed(feed.id, patch);
       return { feedId: feed.id, added, feedTitle: feed.title, feed, status: 'succeeded' };
     } catch (err) {
       clearTimeout(tid);
@@ -345,8 +352,9 @@
             if (fav) patch.favicon = fav;
           } catch { /* ignore */ }
         }
-        await FeedStore.updateFeed(feed.id, patch);
+        // 与直连分支同序：先落条目再写元信息，避免条目写入失败却已记为 succeeded。
         const added = await FeedStore.upsertItems(feed.id, proxied.parsed.items, settings.maxItemsPerFeed);
+        await FeedStore.updateFeed(feed.id, patch);
         console.info('[RSS] fetched via proxy:', feed.url);
         return { feedId: feed.id, added, feedTitle: feed.title, feed, via: 'proxy', status: 'succeeded' };
       } catch (proxyErr) {
@@ -460,9 +468,11 @@
     await checkpointWrites;
     await chrome.storage.local.remove(POLL_CHECKPOINT_KEY);
 
-    // 通知上层（feed-notifier 会监听）
+    // 通知上层（feed-notifier 会监听）。回调是 async 函数：同步 try 抓不到它返回的
+    // rejected promise，内部 storage 读失败会变成 unhandled rejection，且后半段的
+    // badge 更新不再执行（未读数长期停在旧值）。必须 await 后再吞错。
     if (typeof global.onFeedPollComplete === 'function') {
-      try { global.onFeedPollComplete(results); } catch { /* ignore */ }
+      try { await global.onFeedPollComplete(results); } catch { /* ignore */ }
     }
     // 广播数据变化
     FeedStore._broadcast('rssDataChanged', { results, summary });
@@ -504,6 +514,10 @@
       const ct = resp.headers.get('content-type') || '';
       const parsed = RssParser.parseFeed(text, ct);
       if (!parsed) throw new Error('parse_failed');
+      // 与 fetchOne 的判定保持一致：解析器对普通 HTML 页也会返回非 null（items 为空、
+      // title 取自 <title>），若此处不校验条目数，订阅普通网页会"添加成功"，
+      // 之后每轮拉取都以 empty_feed 失败并累积退避，用户只看到源一直报错。
+      if (!Array.isArray(parsed.items) || parsed.items.length === 0) throw new Error('empty_feed');
       // favicon 异步获取，不阻塞订阅响应
       let favicon = '';
       // 不 await，先返回空 favicon，后续通过 rssUpdateFeed 补上

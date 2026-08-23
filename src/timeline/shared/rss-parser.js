@@ -13,6 +13,18 @@
 
   // ===== 工具函数 =====
 
+  // 数字实体转字符：fromCodePoint 对 > 0x10FFFF 会抛 RangeError。
+  // 单个越界实体（如 &#1114112;）此前会让整篇 feed 解析抛错，被上层当成拉取失败，
+  // 累计 3 次后进入退避 —— 一个字符就能让订阅源永久不可用。越界时丢弃该实体。
+  function codePointToString(code) {
+    if (!Number.isFinite(code) || code <= 0 || code > 0x10FFFF) return '';
+    try {
+      return String.fromCodePoint(code);
+    } catch {
+      return '';
+    }
+  }
+
   function decodeEntities(s) {
     if (!s) return '';
     return s
@@ -20,15 +32,8 @@
       .replace(/&gt;/g, '>')
       .replace(/&quot;/g, '"')
       .replace(/&apos;/g, "'")
-      .replace(/&#(\d+);/g, (_, n) => {
-        const code = parseInt(n, 10);
-        // fromCodePoint 才能正确处理增补平面字符（如 emoji），fromCharCode 会产出错位代理半区
-        return code > 0 ? String.fromCodePoint(code) : '';
-      })
-      .replace(/&#x([0-9a-fA-F]+);/g, (_, n) => {
-        const code = parseInt(n, 16);
-        return code > 0 ? String.fromCodePoint(code) : '';
-      })
+      .replace(/&#(\d+);/g, (_, n) => codePointToString(parseInt(n, 10)))
+      .replace(/&#x([0-9a-fA-F]+);/g, (_, n) => codePointToString(parseInt(n, 16)))
       .replace(/&amp;/g, '&'); // 必须最后处理，避免二次解码
   }
 
@@ -67,37 +72,59 @@
     return `fallback_${(hash >>> 0).toString(36)}`;
   }
 
+  // 标签匹配正则：容忍可选的命名空间前缀（如 <atom:entry>），开闭标签前缀一致（反向引用）。
+  // 开标签属性段结尾不允许是 `/`：否则 `[^>]*` 会吞掉自闭合标签的斜杠，把
+  // <atom:link rel="self" href="..."/> 当成开标签，再由后面真正的 </link> 闭合，
+  // 于是 <link> 正文被整段吞入（siteUrl / 条目链接会变成 "<link>https://..." 这类垃圾串）。
+  function tagRegExp(tag, flags) {
+    return new RegExp(
+      '<(?:([\\w.-]+):)?' + tag + '(?:\\s[^>]*[^/>])?\\s*>([\\s\\S]*?)</(?:\\1:)?' + tag + '\\s*>',
+      flags,
+    );
+  }
+
+  // 去掉 CDATA 包装（可能有多个）并去除首尾空白
+  function unwrapCdata(raw) {
+    return String(raw || '').replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, (_, c) => c).trim();
+  }
+
   // 提取标签内容（处理 CDATA 与实体），返回第一个匹配的内部文本。
-  // 允许可选的命名空间前缀（如 <atom:entry>），且开闭标签前缀必须一致，
-  // 否则带命名空间的 Atom（<atom:feed>/<atom:entry>）会解析出 0 条。
+  // 无前缀标签优先：前缀容忍会让 <itunes:title>/<dc:title>/<media:description> 与无前缀
+  // 标签等价竞争，谁先出现谁赢，导致播客源的正文字段被命名空间标签劫持。仅当整篇文档不存在
+  // 无前缀标签时，才回退到带前缀的匹配（支持通篇命名空间的 Atom：<atom:feed>/<atom:entry>）。
   function tagContent(parent, tag) {
     if (!parent) return '';
-    const re = new RegExp('<(?:([\\w.-]+):)?' + tag + '(?:\\s[^>]*)?>([\\s\\S]*?)</(?:\\1:)?' + tag + '\\s*>', 'i');
-    const m = parent.match(re);
-    if (!m) return '';
-    let raw = m[2];
-    // 处理 CDATA 段（可能有多个）
-    raw = raw.replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, (_, c) => c);
-    return raw.trim();
-  }
-
-  // 提取所有指定标签块的内容数组（同样容忍命名空间前缀，前缀开闭一致）
-  function tagBlocks(parent, tag) {
-    if (!parent) return [];
-    const re = new RegExp('<(?:([\\w.-]+):)?' + tag + '(?:\\s[^>]*)?>([\\s\\S]*?)</(?:\\1:)?' + tag + '\\s*>', 'gi');
-    const blocks = [];
+    const re = tagRegExp(tag, 'gi');
+    let prefixedRaw = null;
     let m;
     while ((m = re.exec(parent)) !== null) {
-      blocks.push(m[2]);
+      if (!m[1]) return unwrapCdata(m[2]);
+      if (prefixedRaw === null) prefixedRaw = m[2];
     }
-    return blocks;
+    return prefixedRaw === null ? '' : unwrapCdata(prefixedRaw);
   }
 
-  // 提取自闭合/带属性的 link 标签的 href，按 rel 过滤
+  // 提取所有指定标签块的内容数组。同样是无前缀优先、整体回退带前缀，
+  // 避免 <itunes:*> 之类的同名标签与真正的条目标签混入同一个结果集。
+  function tagBlocks(parent, tag) {
+    if (!parent) return [];
+    const re = tagRegExp(tag, 'gi');
+    const plain = [];
+    const prefixed = [];
+    let m;
+    while ((m = re.exec(parent)) !== null) {
+      (m[1] ? prefixed : plain).push(m[2]);
+    }
+    return plain.length > 0 ? plain : prefixed;
+  }
+
+  // 提取自闭合/带属性的 link 标签的 href，按 rel 过滤。
+  // 必须容忍命名空间前缀：Atom 的 siteUrl 与每条 entry 的 link 都依赖本函数，
+  // 而通篇带前缀的源（<atom:link .../>）此前一条都匹配不到，条目全部不可点击。
   function collectLinks(parent) {
     if (!parent) return [];
     const links = [];
-    const re = /<link\s([^>]*?)(?:\/?)>/gi;
+    const re = /<(?:[\w.-]+:)?link\s([^>]*?)(?:\/?)>/gi;
     let m;
     while ((m = re.exec(parent)) !== null) {
       const attrs = m[1] || '';

@@ -366,11 +366,13 @@ function getDateGroupLabel(timestamp) {
   return i18n('dateWithYear', [monthLabel, String(day), String(year)]);
 }
 
+// innerHTML 只转义 & < >，不转义引号。本函数也用于属性上下文
+// （如 title="${escapeHtml(...)}"），外部内容里的裸引号会闭合属性并注入事件处理器。
 function escapeHtml(str) {
   if (!str) return '';
   const div = document.createElement('div');
   div.textContent = str;
-  return div.innerHTML;
+  return div.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
 // ===== 热力颜色系统（暖橙渐变） =====

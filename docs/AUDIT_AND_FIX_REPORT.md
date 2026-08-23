@@ -1,11 +1,11 @@
 # AI Bookmark OS 全量审查与修复报告
 
-- 报告日期：2026-08-22
+- 报告日期：2026-08-22（第一~三轮）／2026-08-24（第四轮：复核 + 新一轮排查）
 - 审查范围：全仓库（`src/core`、`src/sidepanel`、`src/bookmark-nav`、`src/timeline`、`scripts`、构建与清单配置）
-- 审查方法：三路并行静态审计（核心逻辑 / React UI / 原生时间线模块）→ 对每条发现逐条对照当前源码实证核验（剔除审计代理误报的过期项）→ 分组修复 → 每组修复配回归测试 → 全量门禁验证
-- 验证门禁：`npm test`（56 个测试文件）、`npm run typecheck`、`npm run build`、`npm run preview:check`、`node scripts/audit-project.mjs`、Playwright 真实浏览器 E2E（`scripts/e2e-extension.mjs`，经本机 chromium 构建加载重建后的 `dist/`）
+- 审查方法：多路静态审计（核心逻辑 / React UI / 原生时间线模块）→ 对每条发现逐条对照当前源码实证核验（剔除审计代理误报的过期项）→ 分组修复 → 每组修复配回归测试 → **变异验证测试有效性** → 全量门禁验证
+- 验证门禁：`npm test`（58 个测试文件）、`npm run typecheck`、`npm run build`、`npm run preview:check`、`node scripts/audit-project.mjs`、Playwright 真实浏览器 E2E（`scripts/e2e-extension.mjs`，加载重建后的 `dist/`）
 
-> 三轮修复合计：**第一轮 24 项**（功能闭环 / P1 交互 / 存储安全），**第二轮 14 项**（遗留项全部处置：12 项修复 + 2 项评估后判定不改），**第三轮 4 项**（用户反馈的主动学习链路：手工移动不自动学习 + “采用首选”报错滞留 + 批量程序性移动学习隔离）。所有修改均在工作区未提交，可按组拆分提交。
+> 四轮修复合计：**第一轮 24 项**（功能闭环 / P1 交互 / 存储安全），**第二轮 14 项**（遗留项全部处置：12 项修复 + 2 项评估后判定不改），**第三轮 4 项**（用户反馈的主动学习链路：手工移动不自动学习 + “采用首选”报错滞留 + 批量程序性移动学习隔离），**第四轮 16 项**（复核前三轮修复 + 新排查：1 项 P0 XSS、2 项前三轮修复留下的时序漏洞、13 项 RSS/存储/权限缺陷）。第一~三轮已提交于 `b189936`，第四轮见本轮提交。
 
 ---
 
@@ -62,6 +62,31 @@
 | 41 | P3 | 报错 toast 直接展示原始错误码（“处理失败：bookmark_changed”），用户无法理解 | `settings.js`、`shared/i18n.js` | 新增 `recommendationResolveErrorText` 映射（`review_item_not_found`→“该项已被处理或移除”等）；`staleDiscarded` 结果以成功类 toast 提示“书签已变动，过期建议已自动移除”；新增 i18n 键 `reviewStaleDiscarded`/`reviewItemMissing`（en + zh_CN） | 源码契约断言（§6）：映射存在、双语言键齐全 |
 | 42 | P1（#39 引入风险的闭环，审计自查发现） | #39 让手工移动自动学习后，**批量程序性移动**必须与之隔离，否则一次全量分类应用（数百~数千次 `chrome.bookmarks.move`）会把分类器自身输出误学为用户归档意图，污染全部学习规则；设置页“应用建议”也会因移动+建议反馈双重记账。程序性标记（`markProgrammaticBookmarkMove`）原本只覆盖 background 内部 3 处，`src/core/bookmarks.ts` 的全量/局部应用与撤销（sidepanel 上下文执行）完全未标记 | `background.js`、`src/core/bookmarks.ts`、`settings.js` | 三层隔离：① 抑制窗口——新消息 `setMoveLearningSuppression`（10 分钟硬上限防调用方崩溃后永不恢复），`handleSingleBookmarkMoved` 在窗口内只更新镜像不学习；② core 四入口（`applyToBookmarks`/`applyPartialToBookmarks`/`undoApply`/`undoLatestApply`）改为薄导出包装：进入时暂停、`finally` 恢复（嵌套计数防误恢复；无 runtime 的测试桩下静默跳过）；③ 单条标记——新消息 `markProgrammaticMove`，设置页“应用建议”移动前标记（其学习反馈由 `submitBookmarkRecommendationFeedback` 统一产生，避免重复）；导航页拖放/编辑选目录是真实手工归档，**保留学习** | `test-active-learning-autolearn.mjs` §7：抑制窗口内镜像更新但零学习；窗口结束后恢复正常学习；单条程序性标记不学习；§8 契约：四入口 Internal+包装+finally 恢复、两个新消息、10 分钟上限、设置页标记存在 |
 
+### 第四轮修复（对前三轮修复的复核 + 新一轮全量排查）
+
+复核结论：前三轮 42 项修复**在当前代码中全部真实存在**，实现方式与报告描述一致（逐项回源码核对，重点复验了 `llm.ts` 词法扫描器、`health.ts` 公共后缀表、`bookmarks.ts` 树索引、`classificationPlanArchive.ts` unpin 守卫、第三轮主动学习三层隔离）。但第三轮 #42 的"程序性移动隔离"存在**两处同源实现缺陷**（下表 #43/#44）：隔离判定被放在异步串行队列的**出队时刻**，而批量应用的真实时序会让判定失效。原测试直接调用 `handleSingleBookmarkMoved`、绕过了 `onMoved` 监听器与队列，因此漏过。
+
+| # | 级别 | 问题 | 位置 | 修复方式 | 验证 |
+|---|---|---|---|---|---|
+| 43 | P1（学习数据污染） | 抑制窗口判定发生在队列**出队时**：批量应用瞬间产生海量 `onMoved` 全部入队，队列每条都要 `bookmarks.get` + `loadBookmarkFolderOptions`（读全树）+ 镜像写入，消费远慢于产生；core 侧 `finally` 的"恢复学习"早已执行，积压事件遂以"未抑制"状态出队，把分类器自身输出误学为用户手工归档规则 | `background.js` `onMoved` 监听器 / `handleSingleBookmarkMoved` | 抑制状态改为在**事件到达时同步捕获**（`suppressedAtEvent`），随事件传入处理函数；判定取"事件时"与"当前"的并集，兼容函数被直接调用（无事件上下文）的场景 | 新增 `test-move-learning-queue-race.mjs`：走真实 `onMoved` 路径 + 闸门控制队列积压，复现"抑制期入队→解除→出队"。改回旧逻辑实测泄漏 3 条规则 |
+| 44 | P1（学习数据污染） | 单条程序性标记（`markProgrammaticBookmarkMove`，设置页"应用建议"用）带 30 秒 TTL，但 `consumeProgrammaticBookmarkMove` 同样在**出队时**才校验：批量应用建议时队列积压超过 30 秒，标记被判为"已过期"而漏判，同样造成误学 | 同上 | 标记消费同样移到事件到达时刻（`programmaticAtEvent`）；处理函数直接采信该结论，不再重复消费。标记按书签 id 记录，文件夹移动事件查不到条目、不会误消费 | 同上，§TTL 场景用可控时钟推进 31 秒复现；改回旧逻辑实测误学 1 条 |
+| 45 | **P0（XSS，可提权到扩展 origin）** | `escapeHtml` 走 `textContent`→`innerHTML`，**只转义 `& < >`，不转义引号**，却被用于 21 处 HTML **属性**上下文（如 `<img src="${esc(url)}">`）。RSS `extractImageUrl` 取到属性值后又执行 `decodeEntities`，把 `&quot;` 还原成真引号 → 恶意订阅源可闭合属性注入 `onerror`，在扩展页面 origin 内执行任意脚本（可访问 `chrome.bookmarks` 等全部权限） | `standalone.js`、`popup.js`、`settings.js`、`checker.js`、`mdi-manager.js` 各自的 `escapeHtml` | 五处实现统一补齐 `"`→`&quot;`、`'`→`&#39;`（在各自原有风格上最小改动，不改函数名/签名/调用点）。`graph.js`、`escapeHtmlForExport`、`escapeHtmlForTagRules` 原本已正确转义引号，不动 | `test-audit-round4-fixes.mjs` §1：5 个文件逐一断言引号被转义 + 实测注入载荷 `url="...&quot; onerror=&quot;alert(1)"` 无法闭合属性 |
+| 46 | P1（单字符致订阅源永久失效） | `decodeEntities` 用 `String.fromCodePoint(code)` 只校验 `code > 0`，**缺上界**：`&#1114112;` / `&#x110000;` 抛 `RangeError`，异常经 `stripTags`→`parseFeed` 冒泡，被 `feed-fetcher` 当成拉取失败（`failCount++`、`lastError:"Invalid code point 1114112"`），累计 3 次进入退避，一个字符即可让订阅源永不恢复 | `rss-parser.js` | 抽出 `codePointToString`：越界（`> 0x10FFFF`）或非法时丢弃该实体，并保留 `try/catch` 兜底；emoji 等增补平面字符行为不变 | §2：三种越界写法均正常解析，`&#128512;`（😀）仍正确解码 |
+| 47 | P1（条目链接损坏） | 标签匹配正则的开标签段 `(?:\s[^>]*)?>` 中 `[^>]*` 会吞掉自闭合斜杠，把 `<atom:link rel="self" href="..."/>` 当作开标签；闭合侧 `(?:\1:)?` 为可选组，后面真正的 `</link>` 又能闭合它，于是 `<link>` 正文被整段吞入。WordPress 类源近乎通用 | `rss-parser.js` `tagContent`/`tagBlocks` | 提取共用 `tagRegExp`，开标签属性段结尾禁止为 `/`（`(?:\s[^>]*[^/>])?\s*>`） | §3：`siteUrl` 从 `"<link>https://ex.com/site"` 修正为 `"https://ex.com/site"`；条目 `link` 同样修正 |
+| 48 | P1（第三轮 #32 未闭环） | 第三轮给 `tagContent`/`tagBlocks`/`extractFeedBlock` 加了命名空间前缀容忍，但 `collectLinks` 的 `/<link\s([^>]*?)(?:\/?)>/gi` **未加**，而 Atom 的 `siteUrl` 与 `entry.link` 全部依赖它 → 带前缀的 Atom"能解析出条目但全部不可点击" | `rss-parser.js` `collectLinks` | 正则补可选前缀 `<(?:[\w.-]+:)?link\s...`，与其余标签匹配保持一致 | §4：`<atom:feed>` 的 `siteUrl` 与 entry `link` 由 `""` 修正为正确 URL |
+| 49 | P2（本次前缀容忍引入的回归） | 前缀容忍让 `<itunes:title>`/`<dc:title>`/`<media:description>` 与无前缀标签**等价竞争**，`tagContent` 取第一个匹配、谁先出现谁赢：播客源的 `title`/`link`/`description`/`author` 会被命名空间标签劫持 | `rss-parser.js` | 改为**无前缀优先**：扫描全部匹配，命中无前缀标签立即返回；仅当整篇不存在无前缀标签时才回退到带前缀（继续支持通篇命名空间的 Atom）。`tagBlocks` 同构处理 | §5：`<itunes:title>WRONG</itunes:title>` 先于 `<title>RIGHT</title>` 时，结果为 `RIGHT`；RSS2/Atom/RDF 全部回归通过 |
+| 50 | P1（用户数据静默丢失） | `upsertItems` 达上限后 `existing.length = limit` 纯按时间序截断，**不保护** `starred:true` / `bookmarkId != null` 的条目。星标视图直接读同一分片，且这些用户状态（星标、与书签的关联 id）**无任何别处备份** → 加星的旧文章被新文章挤出即永久消失 | `feed-store.js` | 截断时先保留全部受保护条目（星标 / 已建书签），剩余额度再按时间序填补普通条目，最终仍按时间序输出 | §6：受保护条目在截断后留存；对照场景（无受保护条目）截断行为与原来完全一致 |
+| 51 | P2（清空后日志复活） | 第二轮把 `logAIEvent` 串行化进 `logWriteChain`，但 `clearAILogs` 直接 `storage.remove`**绕过同一条链**：某次写入已完成 `get`（持有 400 条旧数组）、正 `await set` 时用户点"清空"，`remove` 先生效，随后 `set` 把旧数组连同新条目写回。UI 已提示"日志已清空"，刷新后全部复活 | `ai-logger.js` | `clearAILogs` 改为走 `enqueueLogWrite`，与写入共用同一条串行链 | §7：闸门卡住在飞 `set` 后触发清空，结果为空数组；清空后新日志照常写入 |
+| 52 | P2（订阅普通网页"成功"后永久报错） | `fetchAndInit` 只判 `if (!parsed) throw`，**不校验 `items.length`**；而 `fetchOne` 判 `items.length === 0` 就 `throw empty_feed`。把普通 HTML 页加为订阅会"添加成功"（`title` 取自 `<title>`），此后每轮拉取都以 `empty_feed` 失败并累积退避 | `feed-fetcher.js` | `fetchAndInit` 补 `items.length === 0` → `empty_feed`，与 `fetchOne` 判定对齐（代理分支的 `_fetchViaProxy` 内部已有同样校验） | §9：普通 HTML 页订阅被正确拒绝；对照：真实 feed 仍订阅成功 |
+| 53 | P2（304 永久锁死，文章永久丢失） | `fetchOne` 先 `updateFeed(patch)` 提交 `etag`/`lastStatus:'succeeded'`，**之后**才 `upsertItems`。若条目写入失败，异常被捕获按失败处理，但 **etag 已持久化** → 下一轮带 `If-None-Match` 得到 304 直接标记成功返回 `added:[]`，这批文章永远不会再写入 | `feed-fetcher.js` | 直连与代理两个分支统一改为**先落条目、再提交元信息** | §10：源码顺序断言 + 行为断言（`upsertItems` 抛错时 `etag` 未落库、状态记为 `failed`） |
+| 54 | P2（异常逃逸 + badge 停更） | `try { global.onFeedPollComplete(results); } catch {}` 是**同步** try，而回调是 `async` 函数：其内部 `getSettings()`/`getAllFeeds()` 一旦 reject 就变成 unhandled rejection（同步 catch 抓不到），且回调末尾的 `await updateBadge()` 不再执行，未读数长期停在旧值 | `feed-fetcher.js` `pollAll` | 改为 `await global.onFeedPollComplete(results)` 后再吞错 | §13：回调 reject 时 `pollAll` 不抛出、且已等待其完成（行为级区分 await 与否） |
+| 55 | P3（功能被误伤） | `_isPrivateOrLocalHost` 用 `host.startsWith('fc')/('fd')` 判定 IPv6 ULA，但对**任意主机名**做前缀匹配：`fcbarcelona.com`、`fdroid.org`、`fc2.com`、`fedoraproject.org` 均被判为私有地址，代理回退被静默禁用且用户看不到原因 | `feed-fetcher.js` | 前缀判断限定在 IPv6 字面量内（`host.includes(':')` 守卫内），IPv4 与域名走原有分支 | §8：5 个公网域名判定为 false，12 个真实私有/本地地址仍全部拦截 |
+| 56 | P3（孤儿分片永久泄漏） | `removeFeed` 先从 `rss_feeds` 摘除、再删 `rss_items_<id>`，两次独立写入。若第二步失败或 SW 在两步间被回收，`rss_items_<id>` 成为孤儿：后续所有遍历都以 `getAllFeeds()` 为起点，**无任何路径能再发现或清理它**，也没有 GC | `feed-store.js` | 两次写入无法原子化，改为挑**失败后可恢复**的顺序：先删条目分片、再摘除 feed。本序失败只留下"条目为空但仍在列表里的 feed"，下一轮拉取即可自行补齐 | §11：分片删除失败时索引保留（可恢复）；对照：正常删除同时清掉索引与分片 |
+| 57 | P3（权限缺失伪装成"没有源"） | `discoverInTab` 的 `catch { return [] }` 覆盖了 `executeScript` 因未授予 `optional_host_permissions` 而抛的异常 → UI 显示"未发现可订阅的 RSS 源"，用户无从得知真实原因是缺权限，也不会被引导授权 | `feed-discover.js`、`background.js` 右键订阅 | 权限类错误上抛可识别错误码 `rss_discover_permission_denied`（其余错误仍返回 `[]`）；右键订阅路径补一条可行动通知提示去授权。消息通道 `rssDiscoverActive` 原有 catch 已能返回 `{success:false,error}` | §12：权限错误正确上抛；对照：真正无源仍返回 `[]`、不可注入页面（`chrome://`）仍静默返回 `[]` |
+| 58 | P3（测试自身缺陷，凌晨必然失败） | `test-popup-timeline-grouping.mjs`（v1.0.9 会话新增）以 `Date.now()` 为基准构造 `now-60s` 与 `now-3h` 两个"今天"样本：在 00:00~03:00 之间运行时 `now-3h` 落到前一天，多出"昨天"分组令断言无故失败（本次即在 00:19 触发）。产品代码正确 | `scripts/test-popup-timeline-grouping.mjs` | 基准锚定到"当天本地正午"，小时级偏移始终留在同一天；日期级偏移（10/11 天）行为不变 | 修复后任意时刻稳定通过 |
+
+**变异验证**：为避免"测试空转"，逐项把修复改回旧逻辑并重跑测试，确认 **15/15 变异全部被捕获**（含 #43/#44 的队列时序、#45 五处 `escapeHtml`、#50 星标保护、#53 落库顺序、#54 的 await）。变异脚本每次改写后立即校验恢复结果，全部文件已确认复原。
+
 ### 评估后判定不修（附理由）
 
 | 项 | 位置 | 不修理由 |
@@ -82,6 +107,10 @@
 
 **第三轮**：`src/timeline/background/background.js`（`queueBookmarkMoveObservation` 自动学习、`resolveRecommendationReview` 过期自动移除、移动学习抑制窗口 + `setMoveLearningSuppression`/`markProgrammaticMove` 消息）、`src/core/bookmarks.ts`（四入口程序性移动抑制包装）、`src/timeline/pages/settings/settings.js`（结果文案映射 + 重新评估应用移动标记）、`src/timeline/shared/i18n.js`（2 键 × en/zh_CN）；新增 `test-active-learning-autolearn.mjs`（8 节），更新 `test-recommendation-review.mjs` 过期契约。
 
+**第四轮**：`src/timeline/background/background.js`（`onMoved` 事件时捕获抑制状态与程序性标记、右键订阅权限提示）、`src/timeline/shared/rss-parser.js`（`codePointToString` 上界保护、`tagRegExp` 统一标签匹配 + 自闭合斜杠、无前缀优先、`collectLinks` 前缀容忍）、`src/timeline/shared/feed-store.js`（截断保护星标/已建书签条目、`removeFeed` 可恢复顺序）、`src/timeline/shared/ai-logger.js`（`clearAILogs` 入写入队列）、`src/timeline/background/feed-fetcher.js`（先落条目再提交 etag ×2 分支、`fetchAndInit` 校验条目数、await 异步回调、ULA 判定限定 IPv6）、`src/timeline/background/feed-discover.js`（权限错误上抛）、五处 `escapeHtml` 补引号转义（`standalone.js`、`popup.js`、`settings.js`、`checker.js`、`mdi-manager.js`）；新增 `test-audit-round4-fixes.mjs`（13 节）、`test-move-learning-queue-race.mjs`（真实 `onMoved` 路径 + 队列积压/TTL 时序），修复 `test-popup-timeline-grouping.mjs` 的时间依赖缺陷。
+
+第四轮改动共 12 个源文件、158 增 45 删（不含新增测试 828 行）。全部修改遵循"不新增/不重命名函数、不改签名与数据格式"的约束：唯一的接口面变化是 `handleSingleBookmarkMoved` 新增一个可选 `options` 参数（默认 `{}`，省略时行为与旧实现完全一致），`rss-parser.js` 内部新增 `codePointToString`/`tagRegExp`/`unwrapCdata` 三个私有辅助函数（不进导出面）。
+
 ## 三、配置 / 接口 / 依赖变更
 
 - manifest（含打包脚本）：`+unlimitedStorage`；无其他权限/依赖变更，无 npm 依赖增删，无 storage schema 变更（新增 UI 全部复用既有键与后台单写者消息）。
@@ -91,18 +120,34 @@
 
 | 命令 | 结果 |
 |---|---|
-| `npm test` | **All 56 test files passed**（基线 51 → 56：+6 节新回归、+主动学习自动学习链路；含第三轮更新的推荐审核过期契约） |
+| `npm test` | **All 58 test files passed**（56 → 58：+`test-audit-round4-fixes` +`test-move-learning-queue-race`） |
 | `npm run typecheck` | 通过（`typeof zh` 约束下 9 语言字典全量一致） |
 | `npm run build` + `npm run preview:check` | 构建成功，`VERIFY PASS` |
 | `node scripts/audit-project.mjs` | `PROJECT AUDIT PASS` |
+| dist 产物核验 | 22 项逐条抽查通过（第四轮 19 项 + v1.0.9 两处时间轴修复 + manifest 版本） |
 | E2E（`scripts/e2e-extension.mjs`，加载重建后的 `dist/`） | **Extension E2E passed**（真实浏览器：SW 启动、合成书签、时间线、设置 AI 连接 mock、RSS、推荐审核、键盘焦点、溢出检查） |
 
-说明：Playwright 官方 chromium-1228 下载在本网络停滞，E2E 经 `executablePath` 使用本机已有的 chromium-1208 构建运行（等效，Chrome 140+，高于 manifest 要求的 114）。
+说明：Playwright 官方 chromium-1228 下载在本网络停滞，E2E 经 `executablePath` 使用本机已有的 chromium 构建运行（Chrome 140+，高于 manifest 要求的 114）。
+
+### 第四轮的变异验证（测试有效性证明）
+
+新增测试若只是"跟着现有实现写断言"，无法证明它真的守护了缺陷。因此对第四轮每一项修复，都把源码临时改回修复前的旧逻辑，重跑对应测试，确认它**会失败**，随后恢复并校验文件复原：
+
+```
+变异被捕获: 15/15    所有文件已恢复: YES
+```
+
+15 项逐条为：#1 引号转义、#2 实体上界、#3 自闭合斜杠、#4 前缀 link、#5 星标保护、#6 清空入队、#7 标签劫持、#8 条目数校验、#10 etag 顺序、#11 await 回调、#12 ULA 守卫、#14 删除顺序、#15 权限上抛、#A 抑制时序、#B 标记 TTL。
+
+首轮变异脚本暴露出两个问题，均已处置：一是 #11 当时为 `WEAK`（改回旧逻辑测试仍通过 → 说明缺乏守护），补 §13 行为断言后转为 `OK`；二是脚本在 Windows 下恢复 `feed-fetcher.js` 时写入失败（errno -4094），把该文件留在了变异状态——已即时发现并恢复，重写后的脚本对每次恢复做写后校验与重试，并在最终统一核对全部文件。
 
 ## 五、残余风险与后续建议
 
-1. **跨上下文写竞争（收敛但未根除）**：smart-tagger/ai-logger 现在同上下文内严格串行；popup/SW/独立窗口多上下文同时写同一 key 仍有最后写者覆盖窗口。根治需迁移到后台 `mutateStorageResource` 单写者（建议后续单独一轮做，配合消息协议改造）。
+1. **跨上下文写竞争（收敛但未根除）**：smart-tagger/ai-logger 现在同上下文内严格串行（第四轮把 `clearAILogs` 也纳入同一条链）；popup/SW/独立窗口多上下文同时写同一 key 仍有最后写者覆盖窗口。根治需迁移到后台 `mutateStorageResource` 单写者（建议后续单独一轮做，配合消息协议改造）。
 2. **词法感知修复的边界**：模型输出含未闭合双引号时，字符串状态跟踪可能错位，导致修复不生效——此时行为退回“解析失败→JSON 修复请求/重连”，与修复前一致，无数据风险。
 3. **公共后缀表为人工维护**：未覆盖的二级后缀（如小众国别后缀）仍按后两段分组，仅影响并发度不影响正确性。
-4. **E2E 浏览器版本**：本机 chromium-1208 运行；标准 CI 环境执行 `npx playwright install` 后可直接跑官方链路。
-5. 全部修改未提交；建议按“存储安全 / 功能闭环 / UI 与 i18n / 解析与并发 / 性能 / 测试”分组提交，每组均已有对应回归测试护航。
+4. **RSS 解析器是正则实现，存在结构性上限**：第四轮修掉了自闭合标签、命名空间前缀、越界实体三类问题，但 CDATA 内出现 `</item>` 字面量仍会截断条目块（实测该条目 `link` 解析为空，标题仍在）。正则无法理解 CDATA 边界，根治需换 XML 解析器；SW 环境无 `DOMParser`，需引入依赖，属独立技术选型，未在本轮改动。
+5. **`escapeHtml` 现在转义引号，产出串变长**：`&quot;`/`&#39;` 比原字符长，若某处把 `escapeHtml` 的结果用于长度计算或再解码，行为会变化。已核查全部调用点均为 HTML 拼接，无此类用法。
+6. **`removeFeed` 仍非原子**：第四轮只把两次写入调整为"失败后可自愈"的顺序（先删分片再摘索引，失败只留空条目的 feed，下轮拉取自行补齐），并未实现真正的事务。Chrome storage 无多键原子写，根治需引入写前日志。
+7. **E2E 浏览器版本**：本机 chromium 构建运行；标准 CI 环境执行 `npx playwright install` 后可直接跑官方链路。
+8. 第四轮改动已提交（含报告本身）；前三轮改动的提交状态见 git 历史 `b189936`。

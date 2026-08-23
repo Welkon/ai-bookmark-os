@@ -123,10 +123,12 @@ async function loadTheme() {
   applyTheme(stored.theme || 'system');
 }
 
+// innerHTML 只转义 & < >，不转义引号。本函数被用于属性上下文
+// （如 title="${escapeHtml(...)}"），书签标题等外部内容里的裸引号会闭合属性。
 function escapeHtml(value) {
   const node = document.createElement('div');
   node.textContent = String(value || '');
-  return node.innerHTML;
+  return node.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
 function boundedNumber(value, fallback, min, max) {

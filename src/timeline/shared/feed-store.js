@@ -97,9 +97,12 @@
   }
 
   async function removeFeed(id) {
-    await mutateStorage(FEEDS_KEY, (stored) => (stored || []).filter(f => f.id !== id));
-    // 经队列串行化后彻底删除条目 key，避免残留空的 rss_items_<id>（旧实现写入 [] 只是清空未删除）。
+    // 先删条目分片再摘除 feed：两次写入无法原子化，只能挑失败后可恢复的顺序。
+    // 反序（先摘 feed）一旦第二步失败或 SW 在两步之间被回收，rss_items_<id> 就成为孤儿：
+    // 后续所有遍历都以 getAllFeeds() 为起点，没有任何路径能再发现或清理它。
+    // 本序失败只会留下"条目为空但仍在列表里的 feed"，下一轮拉取即可自行补齐。
     await mutateStorage(ITEMS_KEY_PREFIX + id, () => undefined);
+    await mutateStorage(FEEDS_KEY, (stored) => (stored || []).filter(f => f.id !== id));
     return { success: true };
   }
 
@@ -152,7 +155,22 @@
       // 回退到 fetchedAt 可让新条目排在旧的无日期条目之前。
       const sortKey = (item) => item.publishedAt || item.fetchedAt || 0;
       existing.sort((a, b) => sortKey(b) - sortKey(a));
-      const limit = maxItems || 100; if (existing.length > limit) existing.length = limit;
+      // 截断时保护用户已产生状态的条目：加星、已建书签的条目一旦被挤出就永久丢失
+      // （星标视图直接读同一分片，且这些状态没有任何别处备份）。
+      // 先按上限取普通条目，再把受保护条目并回，最终仍按时间序输出。
+      const limit = maxItems || 100;
+      if (existing.length > limit) {
+        const isProtected = (item) => !!item.starred || item.bookmarkId != null;
+        const kept = new Set();
+        for (const item of existing) if (isProtected(item)) kept.add(item.id);
+        for (const item of existing) {
+          if (kept.size >= limit && !isProtected(item)) continue;
+          kept.add(item.id);
+        }
+        const next = existing.filter(i => kept.has(i.id));
+        existing.length = 0;
+        existing.push(...next);
+      }
       // 只把截断后仍留存的条目视为"新增"：否则达上限时收到的旧日期(publishedAt=0)新条目
       // 会被排序挤出存储却仍返回给调用方，导致对永不落库的条目反复通知/建书签。
       const survivingIds = new Set(existing.map(i => i.id));

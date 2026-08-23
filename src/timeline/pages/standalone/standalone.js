@@ -330,11 +330,14 @@ function normalizeUrl(url) {
   } catch { return url.toLowerCase(); }
 }
 
+// innerHTML 只转义 & < >，不转义引号。本函数被大量用于属性上下文
+// （如 <img src="${escapeHtml(url)}">），订阅源等外部内容里的裸引号会闭合属性并
+// 注入 onerror 等事件处理器，因此必须补齐引号转义。
 function escapeHtml(str) {
   if (!str) return '';
   const div = document.createElement('div');
   div.textContent = str;
-  return div.innerHTML;
+  return div.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
 function escapeRegExp(s) {

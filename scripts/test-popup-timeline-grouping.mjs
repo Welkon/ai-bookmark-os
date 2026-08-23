@@ -58,7 +58,13 @@ new vm.Script([
 ].join('\n')).runInContext(context);
 
 const DAY = 24 * 60 * 60 * 1000;
-const now = Date.now();
+// 基准锚定到"当天本地正午"而不是 Date.now()：用例里有 now-60s / now-3h 两个"今天"的样本，
+// 若在 00:00~03:00 之间运行，减去 3 小时会落到前一天，多出一个"昨天"分组让断言无故失败。
+// 正午基准让小时级偏移始终留在同一天，日期级偏移（10/11 天）行为不变。
+const todayLocal = new Date();
+const now = new Date(
+  todayLocal.getFullYear(), todayLocal.getMonth(), todayLocal.getDate(), 12, 0, 0, 0,
+).getTime();
 
 // 置顶书签的添加时间早于今天的书签，用于验证它不会把自己所属的日期分组顶到最前面
 context.renderTimeline([
