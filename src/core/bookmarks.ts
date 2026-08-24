@@ -380,6 +380,9 @@ async function buildBookmarkNodeIndex(): Promise<Map<string, chrome.bookmarks.Bo
 
 const FULL_PLAN_CHANGED_ERROR = '分类方案中的书签已变化，请基于当前书签重新生成全量分类方案。';
 const PARTIAL_PLAN_CHANGED_ERROR = '所选目录中的书签已变化，请重新执行分类。';
+// 撤销时部分书签无法移回原位（原父目录被用户删除、目标只读等）。全量与局部路径
+// 共用同一文案：撤销记录已保留，重试即可继续恢复剩余书签。
+const PARTIAL_RESTORE_ERROR = '部分书签未能恢复，已保留撤销记录，请稍后重试。';
 export interface ClassificationApplySource {
   scope: ClassificationScope;
   fingerprint: string;
@@ -1801,7 +1804,7 @@ async function undoPartialApplyRecord(
       moves: remainingMoves,
       status: 'rollback-pending',
     });
-    throw new Error('部分书签未能恢复，已保留撤销记录，请稍后重试。');
+    throw new Error(PARTIAL_RESTORE_ERROR);
   }
 
   await removePartialCreatedFolders(record);
@@ -1841,14 +1844,22 @@ async function undoFullApply(
   );
   const { restored, remainingMoves } = await restoreBookmarkMoves(record, onProgress, restoredFolderIds);
   if (remainingMoves.length > 0) {
+    // 保留撤销记录（含未恢复的 moves），数据不丢，用户可重试。
+    // 必须抛错：调用方（App.tsx handleUndo）只在 catch 里报错，成功分支无条件显示
+    // “已撤销，恢复 N 条书签”。若此处静默返回，用户会在仍有书签留在 AI 目录的情况下
+    // 看到成功提示并关闭面板，不知道需要再撤销一次。与局部撤销
+    // （undoPartialApplyRecord）的同一情形保持一致。
     await chrome.storage.local.set({
       [APPLY_RECORD_KEY]: { ...record, moves: remainingMoves },
     });
-    return restored;
+    throw new Error(PARTIAL_RESTORE_ERROR);
   }
 
   // New full applies record every created folder. Never removeTree here: a user may
   // have added bookmarks or folders under the AI root after the classification ran.
+  // 清理失败时保留记录（moves 已清空）：出口是用户先把自己放进 AI 目录的内容移走，
+  // 再撤销一次即可完成目录清理。由 testUndoNeverRecursivelyDeletesNewRootWithUserContent
+  // 与 testUndoKeepsUnrestoredBookmarks 共同守护，不要改成无条件移除记录。
   if (Array.isArray(record.createdFolderIds)) {
     if (!(await removeOwnedCreatedFolders(record))) {
       await chrome.storage.local.set({

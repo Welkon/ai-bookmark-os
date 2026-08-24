@@ -347,10 +347,16 @@
         || (it.tags && it.tags[0]) // 兜底用 tag
         || '';
       const imageUrl = it.image || it.banner_image || '';
+      const itemTitle = stripTags(it.title || '');
+      const itemLink = it.url || it.external_url || '';
       return {
-        guid: it.id || it.url || '',
-        title: stripTags(it.title || ''),
-        link: it.url || it.external_url || '',
+        // 与 RSS / Atom 两条路径保持同一套兜底链。此前只有 `it.id || it.url`：
+        // 只带 title/content 的条目 guid 为空，能通过下面的 filter（有标题即保留），
+        // 却会被 upsertItems 的 `!it.guid` 无条件跳过——既不入库也不计入新增，
+        // 每轮拉取都重新解析再丢弃，用户永远看不到这些文章且没有任何提示。
+        guid: it.id || itemLink || itemTitle || fallbackItemGuid(itemTitle, pub),
+        title: itemTitle,
+        link: itemLink,
         author,
         publishedAt: pub,
         summary,

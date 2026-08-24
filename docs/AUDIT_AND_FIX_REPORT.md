@@ -1,11 +1,11 @@
 # AI Bookmark OS 全量审查与修复报告
 
-- 报告日期：2026-08-22（第一~三轮）／2026-08-24（第四轮：复核 + 新一轮排查）
+- 报告日期：2026-08-22（第一~三轮）／2026-08-24（第四轮：复核 + 新一轮排查）／2026-08-25（第五轮：RSS 累积功能 + 全量审查）
 - 审查范围：全仓库（`src/core`、`src/sidepanel`、`src/bookmark-nav`、`src/timeline`、`scripts`、构建与清单配置）
 - 审查方法：多路静态审计（核心逻辑 / React UI / 原生时间线模块）→ 对每条发现逐条对照当前源码实证核验（剔除审计代理误报的过期项）→ 分组修复 → 每组修复配回归测试 → **变异验证测试有效性** → 全量门禁验证
-- 验证门禁：`npm test`（58 个测试文件）、`npm run typecheck`、`npm run build`、`npm run preview:check`、`node scripts/audit-project.mjs`、Playwright 真实浏览器 E2E（`scripts/e2e-extension.mjs`，加载重建后的 `dist/`）
+- 验证门禁：`npm test`（60 个测试文件）、`npm run typecheck`、`npm run build`、`npm run preview:check`、`node scripts/audit-project.mjs`、Playwright 真实浏览器 E2E（`scripts/e2e-extension.mjs`，加载重建后的 `dist/`）
 
-> 四轮修复合计：**第一轮 24 项**（功能闭环 / P1 交互 / 存储安全），**第二轮 14 项**（遗留项全部处置：12 项修复 + 2 项评估后判定不改），**第三轮 4 项**（用户反馈的主动学习链路：手工移动不自动学习 + “采用首选”报错滞留 + 批量程序性移动学习隔离），**第四轮 16 项**（复核前三轮修复 + 新排查：1 项 P0 XSS、2 项前三轮修复留下的时序漏洞、13 项 RSS/存储/权限缺陷）。第一~三轮已提交于 `b189936`，第四轮见本轮提交。
+> 五轮修复合计：**第一轮 24 项**（功能闭环 / P1 交互 / 存储安全），**第二轮 14 项**（遗留项全部处置：12 项修复 + 2 项评估后判定不改），**第三轮 4 项**（用户反馈的主动学习链路：手工移动不自动学习 + “采用首选”报错滞留 + 批量程序性移动学习隔离），**第四轮 16 项**（复核前三轮修复 + 新排查：1 项 P0 XSS、2 项前三轮修复留下的时序漏洞、13 项 RSS/存储/权限缺陷），**第五轮 9 项**（RSS 累积保留新功能 + 该功能引入的 3 项分页回归 + 5 项既有缺陷）。第一~三轮已提交于 `b189936`，第四轮于 `95316cd`，第五轮见本轮提交。
 
 ---
 
@@ -87,6 +87,41 @@
 
 **变异验证**：为避免"测试空转"，逐项把修复改回旧逻辑并重跑测试，确认 **15/15 变异全部被捕获**（含 #43/#44 的队列时序、#45 五处 `escapeHtml`、#50 星标保护、#53 落库顺序、#54 的 await）。变异脚本每次改写后立即校验恢复结果，全部文件已确认复原。
 
+### 第五轮：RSS 累积保留（新功能）+ 全量审查
+
+本轮先按用户需求实现"RSS 订阅累积保留"，再做一次全项目审查。累积功能本身改变了一个既有前提——**单个源的条目数从有上限变成无上限**，因此必须同时处理两条配套链路，否则功能上线即引入性能与正确性问题：条目全量经 `sendMessage` 结构化克隆回前台（负载随历史无上限增长）、单 feed 视图一次性渲染全部条目（DOM 节点数无上限）。
+
+#### 新功能实现
+
+| # | 内容 | 位置 | 说明 |
+|---|---|---|---|
+| N1 | `maxItemsPerFeed: 0` 表示"不限制（累积保留）"，并设为新默认值 | `feed-store.js` | 关键点：不能用 `maxItems \|\| 100` 兜底，那会把"0 = 不限制"错当成未设置。新增 `resolveItemLimit` 显式区分 `0`（不限制）与 `undefined/NaN`（回退 100）。截断分支加 `limit > 0` 守卫 |
+| N2 | 旧默认值一次性迁移 | `feed-store.js` `normalizeSettings` | 老用户存量设置若"无 `settingsVersion` 且恰为旧默认值 100"，视为从未主动改过 → 迁到累积模式；选过 50/200/500 的属主动选择，保持不变。`getSettings` 与 `setSettings` 共用同一归一化函数——否则未迁移的旧值会随 `stored` 展开被写回，迁移永远无法落地 |
+| N3 | 三个有界查询 | `feed-store.js` + `background.js` | `getItemsPage`（单 feed 分页）、`getFeedOverview`（每源只回预览条目 + 真实总数）、`getStarredItems`（后台过滤）。`rssGetItems` 原语义保留不动，供导出等需要全量的场景 |
+| N4 | 单 feed 视图增量分页渲染 | `feed-view.js` | 复用项目既有的 scroll + 哨兵惯例（与 standalone 时间轴一致），未引入新机制 |
+| N5 | 设置页"不限制（累积保留）"选项 + en/zh_CN 文案 | `settings.html`、`settings.js`、`i18n.js` | 顺带修掉设置页未读徽标为算一个数字而拉取全量条目的问题（改用新增的 `rssGetUnreadCount`） |
+
+#### 审查发现并修复的问题
+
+其中 #59~#61 是我自己在 N4 里引入的回归，由审查代理实测复现后修正。
+
+| # | 级别 | 问题 | 位置 | 修复方式 | 验证 |
+|---|---|---|---|---|---|
+| 59 | P1（漏条，本轮引入） | offset 分页在数据集变化时错位：开着"仅未读"读掉一篇后，后台的未读数组整体前移一位，而前台仍用已渲染条数当 offset → 下一页跳过一条，**该文章永远不再出现**，但侧栏未读数仍把它算在内（未读数降不到 0，用户找不到剩下哪几篇） | `feed-view.js`、`feed-store.js` | 改**游标分页**：游标是上一页最后一条的 `{sortKey, id}`，只取"排在该条之后"的条目，与位置无关。同时给排序加 id 兜底形成全序（否则同时间戳条目相对次序不定，游标无法稳定定位）。游标条目自身被读掉也能正确定位（不靠 `findIndex(id)`） | 实测：读掉 10 篇后第二页首条仍为 `i050`，漏条 0 |
+| 60 | P1（重复，本轮引入） | 同一机制的另一面：翻页期间轮询写入新文章插在数组头部，原 offset 位置的条目下移 → 下一页重复回传已渲染的条目。重复卡片会让加星/存书签的 DOM 更新只作用于其中一张，另一张状态永久不同步 | 同上 | 同上（游标是内容基准，不受插入影响）；并保留已渲染 id 集合作为兜底 | 实测：新增 10 篇后重复条数 0 |
+| 61 | P1（本轮引入，高频触发） | 读一篇文章就把已翻的页数全部丢弃：`setRead`/`toggleStar` 写 `rss_items_*` → `storage.onChanged` **在本窗口同样触发** → 重渲染把已加载条数归零、只取第一页。用户滚了 150 篇、点开第 120 篇去读，回来只剩 50 篇且滚动回到顶部。读得越深代价越大 | `feed-view.js` | 记录分页状态所属视图（含未读过滤开关），同视图重渲染时按已加载条数取回并恢复滚动位置；仅视图真正切换时才归零 | 变异验证覆盖（改回归零即失败） |
+| 62 | P2（既有） | overview/starred 卡片的星标按钮 `data-act="star-item"`，而 `toggleStar` 查 `[data-act="star"]`——属性选择器是**精确等值匹配**，拿到 `null` 后 `btn.classList.toggle` 抛 TypeError 被 catch 吞掉，连同"取消星标即移除卡片"一起失效 | `feed-view.js` | 选择器同时列出两种形态 `[data-act="star"], [data-act="star-item"]`，并加空值守卫 | 源码契约断言 |
+| 63 | P2（既有） | "已加星"视图的"标记全部已读"：条目真被标记了，但计数重置逻辑用 `else if (currentView !== 'starred')` 把 starred 排除 → 侧栏与 Tab 徽标停在旧数字，用户看到"更新成功"却觉得未读数没动 | `feed-view.js` | starred 跨多源无法整源清零，改为按实际标记成功的条目逐源扣减 | 源码契约断言 |
+| 64 | P2（既有） | 设置页保存 RSS 设置：后台校验失败（非 https 代理模板 / 多个 `{url}` / 超长）时 `setSettings` 抛错，但被 background 的 catch 转成**正常返回**的 `{success:false}`——`sendMessage` 不会 reject。`saveRssSetting` 丢弃返回值，7 处调用方无条件提示"已保存"，而配置根本没写进存储 | `settings.js` | `saveRssSetting` 显式检查 `success` 并抛错（这也**激活了 proxyFallback 开关处已有但一直是死代码的回滚 catch**）；新增统一反馈助手：失败时提示可行动原因并从存储回读纠正控件状态 | 源码契约断言 + 裸调用计数 |
+| 65 | P2（既有） | JSON Feed 缺 `id` 与 `url` 的条目被静默丢弃：RSS（278 行）与 Atom（318 行）都有 `fallbackItemGuid` 兜底，JSON Feed 路径独独没有 → 空 guid 被 `upsertItems` 无条件 skip，既不入库也不计入新增，且每轮拉取都重新丢弃一次 | `rss-parser.js` | 按同一模式补齐兜底 guid 链 | 实测：3 条中 2 条无 id/url 的条目从丢弃变为正常入库，且跨轮 guid 稳定（不会误判为新文章） |
+| 66 | P3（既有） | 订阅成功提示的篇数是解析条数而非落库条数（"订阅成功（3 篇）"但列表只有 1 篇） | `background.js` 两处订阅路径 | 改用 `upsertItems` 返回的真实 `added` 长度 | dist 产物核验 |
+| 67 | P3（既有） | `getEffectiveDomain` 对多级公共后缀取到后缀本身：`a.b.co.uk` → `co.uk`、`a.b.c.com.cn` → `com.cn` | `smart-tagger.js` | 复用 `core/health.ts` 的公共后缀表思路补一份 | 9 个用例逐一验证 |
+| 68 | P1（既有，core 侧） | 全量撤销部分失败时**静默返回**，UI 显示"已撤销，恢复 N 条书签"：局部撤销的同一情形会抛错，全量路径不会。而 `App.tsx handleUndo` 只在 catch 里报错，成功分支无条件显示成功 → 用户在仍有书签留在 AI 目录的情况下看到成功提示并关闭面板，不知道需要再撤销一次 | `src/core/bookmarks.ts` `undoFullApply` | 与局部路径对齐抛出同类错误，并提取共用错误常量避免两处文案漂移。撤销记录仍保留（数据不丢，可重试），仅改错误上报 | 更新既有测试 `testUndoKeepsUnrestoredBookmarks` 的契约（保留其"不递归删除、保留记录"的原始意图，新增"必须抛错"维度） |
+
+#### 审查代理报了但我判定不改的一项
+
+`undoFullApply` 在"书签已全部恢复、但 `removeOwnedCreatedFolders` 失败"时会写回 `{moves: []}` 并保留记录，审查代理判定为"记录永久卡死、UI 可撤销永久亮着"。我实测复现了该现象，但**撤回了修复**：`test-full-replacement.mjs:321` 与 `test-regressions.mjs` 两处测试都明确断言这一行为，说明是刻意设计——目录删不掉正是因为用户往里放了自己的东西，保留记录是为了让用户手工移走内容后**再点一次撤销即可完成目录清理**。出口是用户先移走自己的内容，不是无出口循环。单方面推翻两处明确的测试契约不合适；若要改成"达成撤销义务即清除记录"，属产品语义决策，应由用户确认。已在代码中加注释说明为何不能改。
+
 ### 评估后判定不修（附理由）
 
 | 项 | 位置 | 不修理由 |
@@ -111,6 +146,10 @@
 
 第四轮改动共 12 个源文件、158 增 45 删（不含新增测试 828 行）。全部修改遵循"不新增/不重命名函数、不改签名与数据格式"的约束：唯一的接口面变化是 `handleSingleBookmarkMoved` 新增一个可选 `options` 参数（默认 `{}`，省略时行为与旧实现完全一致），`rss-parser.js` 内部新增 `codePointToString`/`tagRegExp`/`unwrapCdata` 三个私有辅助函数（不进导出面）。
 
+**第五轮**：`src/timeline/shared/feed-store.js`（累积模式默认值 + 一次性迁移、`resolveItemLimit`、游标分页 `getItemsPage`、有界查询 `getFeedOverview`/`getStarredItems`、全序比较器 `compareByNewest`）、`src/timeline/pages/standalone/feed-view.js`（游标翻页 + 同视图重渲染保留已加载范围与滚动位置 + 渲染去重兜底 + 星标按钮双选择器 + starred 未读计数扣减）、`src/timeline/background/background.js`（4 个新消息 `rssGetItemsPage`/`rssGetFeedOverview`/`rssGetStarredItems`/`rssGetUnreadCount`、两处订阅报数改用真实落库数）、`src/timeline/pages/settings/settings.js`（`saveRssSetting` 检查 `success` 并抛错 + `saveRssSettingWithFeedback` 统一反馈 + 徽标改用计数消息）、`src/timeline/pages/settings/settings.html`（"不限制（累积保留）"选项）、`src/timeline/shared/rss-parser.js`（JSON Feed 兜底 guid）、`src/timeline/shared/smart-tagger.js`（`getEffectiveDomain` 公共后缀表）、`src/timeline/shared/i18n.js`（3 键 × en/zh_CN）、`src/core/bookmarks.ts`（全量撤销部分失败改为抛错 + `PARTIAL_RESTORE_ERROR` 常量）；新增 `test-rss-accumulate.mjs`（10 节）、`test-audit-round5-fixes.mjs`（8 节），更新 `test-regressions.mjs` 的撤销契约。
+
+第五轮改动共 10 个源文件、517 增 87 删（含新增测试）。接口面变化仅为新增：`getItemsPage` 的 `options.cursor`（不传则回退 offset，旧调用方行为不变）、4 个新消息（`rssGetItems` 原语义完整保留供导出等全量场景使用）。唯一的行为契约变更是 `undoApply` 在部分恢复失败时由"静默返回"改为"抛错"，已同步更新守护测试。
+
 ## 三、配置 / 接口 / 依赖变更
 
 - manifest（含打包脚本）：`+unlimitedStorage`；无其他权限/依赖变更，无 npm 依赖增删，无 storage schema 变更（新增 UI 全部复用既有键与后台单写者消息）。
@@ -120,14 +159,16 @@
 
 | 命令 | 结果 |
 |---|---|
-| `npm test` | **All 58 test files passed**（56 → 58：+`test-audit-round4-fixes` +`test-move-learning-queue-race`） |
+| `npm test` | **All 60 test files passed**（58 → 60：+`test-rss-accumulate` +`test-audit-round5-fixes`） |
 | `npm run typecheck` | 通过（`typeof zh` 约束下 9 语言字典全量一致） |
 | `npm run build` + `npm run preview:check` | 构建成功，`VERIFY PASS` |
 | `node scripts/audit-project.mjs` | `PROJECT AUDIT PASS` |
-| dist 产物核验 | 22 项逐条抽查通过（第四轮 19 项 + v1.0.9 两处时间轴修复 + manifest 版本） |
+| dist 产物核验 | 第四轮 22 项 + 第五轮 17 项逐条抽查通过（含 manifest 版本） |
 | E2E（`scripts/e2e-extension.mjs`，加载重建后的 `dist/`） | **Extension E2E passed**（真实浏览器：SW 启动、合成书签、时间线、设置 AI 连接 mock、RSS、推荐审核、键盘焦点、溢出检查） |
 
 说明：Playwright 官方 chromium-1228 下载在本网络停滞，E2E 经 `executablePath` 使用本机已有的 chromium 构建运行（Chrome 140+，高于 manifest 要求的 114）。
+
+E2E 稳定性：第五轮共运行 4 次，通过 3 次。唯一一次失败落在**主动学习列表分页**断言（`actual: 4, expected: 5`），与本轮 RSS/撤销改动无代码交集；随后连续两次运行均通过。该次失败的完整堆栈已随进程输出被截断，仅存的 `generatedMessage: true` 与脚本中唯一"期望 5"的断言（第 671 行，带自定义消息）相矛盾，因此**未能可靠定位到具体断言行**，作为既有不稳定项如实记录，未纳入本轮修复清单。
 
 ### 第四轮的变异验证（测试有效性证明）
 
@@ -141,6 +182,20 @@
 
 首轮变异脚本暴露出两个问题，均已处置：一是 #11 当时为 `WEAK`（改回旧逻辑测试仍通过 → 说明缺乏守护），补 §13 行为断言后转为 `OK`；二是脚本在 Windows 下恢复 `feed-fetcher.js` 时写入失败（errno -4094），把该文件留在了变异状态——已即时发现并恢复，重写后的脚本对每次恢复做写后校验与重试，并在最终统一核对全部文件。
 
+### 第五轮的变异验证
+
+RSS 累积功能与本轮修复分两批做变异验证，全部通过：
+
+```
+累积功能：      变异被捕获: 8/8    所有文件已恢复: YES
+第五轮修复：    变异被捕获: 8/8    所有文件已恢复: YES
+```
+
+累积 8 项：默认累积、`resolveItemLimit` 的 0 边界、累积模式跳过淘汰、旧默认值迁移、`setSettings` 归一化落地、overview 负载有界、分页排序口径、单 feed 不再全量拉取。
+修复 8 项：游标分页、重渲染保留范围、星标双选择器、starred 计数扣减、`saveRssSetting` 检查 `success`、JSON Feed 兜底 guid、`getEffectiveDomain` 后缀表、全量撤销部分失败上报。
+
+首轮同样暴露出两处测试自身的弱点，均已修正：**#2「重渲染保留已加载范围」当时为 `WEAK`** —— 断言只检查 `preservedCount` 这个标识符是否出现，把它改成常量 `0` 仍能通过；加严为断言完整表达式 `sameView ? articleLoadedCount : 0` 与 `Math.max(ARTICLE_PAGE_SIZE, preservedCount)` 后转为 `OK`。**#6 锚点未命中被跳过** —— 变异脚本里写的 guid 表达式与源码不一致（源码用 `itemLink`），修正锚点后转为 `OK`。这两处正是变异验证的价值所在：不做变异就会把"看起来在守护"的空转断言当成有效覆盖。
+
 ## 五、残余风险与后续建议
 
 1. **跨上下文写竞争（收敛但未根除）**：smart-tagger/ai-logger 现在同上下文内严格串行（第四轮把 `clearAILogs` 也纳入同一条链）；popup/SW/独立窗口多上下文同时写同一 key 仍有最后写者覆盖窗口。根治需迁移到后台 `mutateStorageResource` 单写者（建议后续单独一轮做，配合消息协议改造）。
@@ -149,5 +204,8 @@
 4. **RSS 解析器是正则实现，存在结构性上限**：第四轮修掉了自闭合标签、命名空间前缀、越界实体三类问题，但 CDATA 内出现 `</item>` 字面量仍会截断条目块（实测该条目 `link` 解析为空，标题仍在）。正则无法理解 CDATA 边界，根治需换 XML 解析器；SW 环境无 `DOMParser`，需引入依赖，属独立技术选型，未在本轮改动。
 5. **`escapeHtml` 现在转义引号，产出串变长**：`&quot;`/`&#39;` 比原字符长，若某处把 `escapeHtml` 的结果用于长度计算或再解码，行为会变化。已核查全部调用点均为 HTML 拼接，无此类用法。
 6. **`removeFeed` 仍非原子**：第四轮只把两次写入调整为"失败后可自愈"的顺序（先删分片再摘索引，失败只留空条目的 feed，下轮拉取自行补齐），并未实现真正的事务。Chrome storage 无多键原子写，根治需引入写前日志。
-7. **E2E 浏览器版本**：本机 chromium 构建运行；标准 CI 环境执行 `npx playwright install` 后可直接跑官方链路。
-8. 第四轮改动已提交（含报告本身）；前三轮改动的提交状态见 git 历史 `b189936`。
+7. **累积模式下 storage 读写粒度仍是整个分片**（第五轮新增）：`chrome.storage` 无法只读一页，`getItemsPage` 仍要把整个 `rss_items_<feedId>` 读进内存再切片。游标分页解决的是**跨进程传输体积**（sendMessage 的结构化克隆），不是磁盘读取量。单源累积到极大量级（数万条）时，后台单次读取的内存与 JSON 解析成本会显现。根治需按时间分片存储（如 `rss_items_<feedId>_<yyyymm>`），属存储结构改造，未在本轮做。
+8. **全量撤销的"目录清理失败"仍保留撤销记录**（第五轮评估后判定不改）：审计代理将其报为"记录永久卡死"，但 `test-full-replacement.mjs:321` 与 `test-regressions.mjs` 两处测试都明确断言该行为。复查后认定这是刻意设计而非缺陷——记录保留是为了让用户**先把自己放进 AI 目录的内容移走，再点一次撤销即可完成目录清理**，出口在用户手里。代价是撤销按钮在此期间持续可点且提示"恢复 0 条书签"，体验不佳但数据安全。改变它需要推翻两处既有测试契约，属产品决策，已在源码补注释说明，留待确认。
+9. **E2E 存在一处未定位的不稳定项**（第五轮如实记录）：本轮 4 次运行中有 1 次失败于**主动学习列表分页**断言（`actual: 4, expected: 5`），随后连续两次运行均通过。该区域与本轮 RSS/undo 改动无交集。残留输出中失败断言带 `generatedMessage: true`（表示未传自定义消息），而脚本内唯一期望 5 的断言（`e2e-extension.mjs:671`）是带自定义消息的，两者矛盾，因此**未能从残留输出可靠定位到具体断言行**，不排除是注入 105 条 UI 状态后有在飞的 `loadActiveLearning()` 落地将其冲掉的测试自身竞态（`actual: 4` 恰等于该测试早前断言的真实反馈条数）。此项未修，如实记录待复现后处理。
+10. **E2E 浏览器版本**：本机 chromium 构建运行；标准 CI 环境执行 `npx playwright install` 后可直接跑官方链路。
+11. 第五轮改动（含 RSS 累积功能与本报告）见本轮提交；第四轮见 `95316cd`，前三轮见 `b189936`。

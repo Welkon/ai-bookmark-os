@@ -1725,10 +1725,24 @@ function extractUrlFeatures(url) {
   }
 }
 
+// 多段公共后缀：这些"最后两段"本身不是注册域名。无条件取后两段会让
+// a.b.co.uk 得到 co.uk（后缀本身）而不是 b.co.uk，域名比对随之失准。
+// 与 src/core/health.ts 的 MULTIPART_PUBLIC_SUFFIXES 保持同一思路。
+const MULTIPART_PUBLIC_SUFFIXES = new Set([
+  'co.uk', 'org.uk', 'ac.uk', 'gov.uk', 'me.uk', 'net.uk', 'sch.uk',
+  'com.cn', 'net.cn', 'org.cn', 'gov.cn', 'edu.cn', 'ac.cn',
+  'com.au', 'net.au', 'org.au', 'com.br', 'com.mx', 'com.tr',
+  'co.jp', 'or.jp', 'ne.jp', 'co.kr', 'co.in', 'co.nz', 'co.za',
+  'com.hk', 'com.tw', 'com.sg', 'co.il', 'com.ar',
+]);
+
 function getEffectiveDomain(hostname) {
   if (!hostname) return '';
   const parts = hostname.toLowerCase().split('.');
   if (parts.length <= 2) return hostname;
+  if (MULTIPART_PUBLIC_SUFFIXES.has(parts.slice(-2).join('.'))) {
+    return parts.slice(-3).join('.');
+  }
   return parts.slice(-2).join('.');
 }
 

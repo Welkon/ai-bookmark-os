@@ -238,9 +238,16 @@ async function testUndoKeepsUnrestoredBookmarks() {
   };
 
   const { undoApply } = await importTypeScript('src/core/bookmarks.ts');
-  const restored = await undoApply();
+  // 部分书签未能恢复时必须抛错：调用方（App.tsx handleUndo）只在 catch 里报错，
+  // 成功分支会无条件显示“已撤销，恢复 N 条书签”。若静默返回，用户会在仍有书签
+  // 留在 AI 目录的情况下看到成功提示并关闭面板，不知道需要再撤销一次。
+  // 与局部撤销（undoPartialApplyRecord）的同一情形保持一致。
+  await assert.rejects(
+    () => undoApply(),
+    /部分书签未能恢复/,
+    '部分恢复失败必须上报，不能被当成撤销成功',
+  );
 
-  assert.equal(restored, 1);
   assert.equal(removedTree, false, '存在未恢复书签时不得递归删除 AI 目录');
   assert.equal(removedRecord, false, '部分恢复失败时应保留撤销记录');
   assert.deepEqual(savedRecord?.moves, [record.moves[1]]);

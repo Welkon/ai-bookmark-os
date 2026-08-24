@@ -496,7 +496,8 @@ async function loadRssSettings() {
     await refreshRssUnreadBadge();
   } catch (e) {
     rssPollIntervalSelect.value = '30';
-    rssMaxItemsSelect.value = '100';
+    // 与 DEFAULT_SETTINGS 一致：0 = 不限制（累积保留）
+    rssMaxItemsSelect.value = '0';
     rssAutoDiscoverToggle.checked = true;
     rssNotifyNewToggle.checked = true;
     rssProxyFallbackToggle.checked = false;
@@ -511,8 +512,38 @@ function updateProxyRowState() {
   rssProxyUrlRow.classList.toggle('is-disabled', !rssProxyFallbackToggle.checked);
 }
 
+// 后台校验失败（如代理模板非 https / 含多个 {url} / 超长）时 setSettings 会抛错，
+// 但 background 的 catch 把它转成正常返回的 { success:false, error }——sendMessage 不会 reject。
+// 因此必须显式检查 success 并抛出，否则调用方会在"根本没保存"的情况下提示"已保存"
+// （proxyFallback 开关处已有的 try/catch 也正是依赖抛错才能回滚开关状态）。
 async function saveRssSetting(patch) {
-  await chrome.runtime.sendMessage({ action: 'rssSetSettings', patch });
+  const result = await chrome.runtime.sendMessage({ action: 'rssSetSettings', patch });
+  if (!result || result.success === false) {
+    throw new Error(rssSettingErrorText(result && result.error));
+  }
+  return result;
+}
+
+// 把后台错误码映射为可行动文案，避免直接把 proxy_template_invalid 这类原始码抛给用户
+function rssSettingErrorText(code) {
+  if (code === 'proxy_template_invalid') {
+    return i18n('rssProxyTemplateInvalid') || '代理地址无效：必须是 https 且只包含一个 {url} 占位符';
+  }
+  return code || i18n('saveFailed') || '保存失败';
+}
+
+// 保存 + 反馈：失败时提示真实原因，并从存储回读纠正控件状态
+// （否则控件会停在用户刚选的值上，而存储里其实没变，刷新页面又跳回旧值）。
+async function saveRssSettingWithFeedback(patch) {
+  try {
+    await saveRssSetting(patch);
+    showToast(i18n('settingsSaved'), 'success');
+    return true;
+  } catch (error) {
+    showToast(error?.message || i18n('saveFailed') || '保存失败', 'error');
+    await loadRssSettings();
+    return false;
+  }
 }
 
 // 刷新"最后更新"文本
@@ -549,9 +580,9 @@ async function refreshRssUnreadBadge() {
       rssUnreadBadge.style.display = 'none';
       return;
     }
-    const itemsRes = await chrome.runtime.sendMessage({ action: 'rssGetItems', all: true });
-    const items = (itemsRes && itemsRes.items) || [];
-    const unread = items.filter(i => !i.read).length;
+    // 只取未读总数：原先拉全部条目再前台 filter，累积保留模式下负载会随历史无上限增长。
+    const countRes = await chrome.runtime.sendMessage({ action: 'rssGetUnreadCount' });
+    const unread = Number(countRes?.count) || 0;
     if (unread > 0) {
       rssUnreadBadge.textContent = unread > 99 ? '99+' : String(unread);
       rssUnreadBadge.style.display = '';
@@ -1281,30 +1312,25 @@ mdiWindowEnabledToggle.addEventListener('change', async (e) => {
 // ===== RSS 订阅设置事件绑定 =====
 rssPollIntervalSelect.addEventListener('change', async (e) => {
   const v = parseInt(e.target.value, 10);
-  await saveRssSetting({ pollIntervalMin: v });
-  showToast(i18n('settingsSaved'), 'success');
+  await saveRssSettingWithFeedback({ pollIntervalMin: v });
 });
 
 rssMaxItemsSelect.addEventListener('change', async (e) => {
   const v = parseInt(e.target.value, 10);
-  await saveRssSetting({ maxItemsPerFeed: v });
-  showToast(i18n('settingsSaved'), 'success');
+  await saveRssSettingWithFeedback({ maxItemsPerFeed: v });
 });
 
 rssDefaultFolderSelect.addEventListener('change', async (e) => {
   const v = e.target.value || null;
-  await saveRssSetting({ defaultFolderId: v });
-  showToast(i18n('settingsSaved'), 'success');
+  await saveRssSettingWithFeedback({ defaultFolderId: v });
 });
 
 rssAutoDiscoverToggle.addEventListener('change', async (e) => {
-  await saveRssSetting({ autoDiscover: e.target.checked });
-  showToast(i18n('settingsSaved'), 'success');
+  await saveRssSettingWithFeedback({ autoDiscover: e.target.checked });
 });
 
 rssNotifyNewToggle.addEventListener('change', async (e) => {
-  await saveRssSetting({ notifyNew: e.target.checked });
-  showToast(i18n('settingsSaved'), 'success');
+  await saveRssSettingWithFeedback({ notifyNew: e.target.checked });
 });
 
 rssProxyFallbackToggle.addEventListener('change', async (e) => {
@@ -1336,8 +1362,9 @@ rssProxySaveBtn.addEventListener('click', async () => {
     showToast(i18n('rssProxyUrlPlaceholderMissing') || '代理 URL 必须包含 {url} 占位符', 'error');
     return;
   }
-  await saveRssSetting({ proxyUrl: v });
-  showToast(i18n('settingsSaved'), 'success');
+  // 后台还会校验 https 协议、{url} 恰好一次、长度上限；失败时必须如实提示，
+  // 否则用户看到"已保存"但存储里仍是旧地址（刷新设置页就变回去了）。
+  await saveRssSettingWithFeedback({ proxyUrl: v });
 });
 
 // 测试代理连通性（用阮一峰博客作测试源）

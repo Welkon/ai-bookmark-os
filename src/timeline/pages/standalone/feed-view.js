@@ -32,6 +32,35 @@
   let totalUnread = 0;
   let addDialogEl = null;
 
+  // 单 feed 文章列表分页：累积保留后一个源可能有数千条，既不能一次性渲染成
+  // 数千个 DOM 节点，也不能把整份数据经 sendMessage 传到前台。
+  const ARTICLE_PAGE_SIZE = 50;
+  // "全部订阅"概览每张卡片显示的文章数（卡片布局固定 5 行）
+  const OVERVIEW_ITEMS_PER_FEED = 5;
+  let articleLoadedCount = 0;   // 当前视图已渲染条数
+  let articleTotalCount = 0;    // 当前视图（含未读过滤）总条数
+  let isLoadingArticlePage = false;
+  let articlePageToken = 0;     // 视图切换代次：丢弃过期的分页响应
+  // 翻页游标：上一页最后一条的 { sortKey, id }。用内容基准而非 offset，
+  // 否则翻页期间数据集变化（读掉一篇 / 轮询写入新文章）会漏条或重复。
+  let articleCursor = null;
+  // 已渲染条目 id：游标已能避免重复，这里作为兜底，防止任何边界情况下渲染出重复卡片
+  // （重复卡片会让加星/存书签的 DOM 更新只作用于其中一张，状态永久不同步）。
+  let renderedArticleIds = new Set();
+  // 当前分页状态所属的视图（含未读过滤开关）。标记已读等操作会写 rss_items_*，
+  // storage.onChanged 在本窗口同样触发并重渲染；视图未变时要保留已加载的范围，
+  // 否则用户滚了几页后读一篇文章，列表就塌回第一页、滚动位置回到顶部。
+  let articleViewKey = '';
+
+  function itemCursor(item) {
+    if (!item) return null;
+    return { sortKey: (item.publishedAt || item.fetchedAt) || 0, id: item.id };
+  }
+
+  function currentArticleViewKey() {
+    return `${currentView}:${showUnreadOnly ? 'unread' : 'all'}`;
+  }
+
   // ===== DOM 引用（延迟获取） =====
   let feedListEl = null;
   let feedViewEl = null;
@@ -160,6 +189,17 @@
           article.classList.remove('has-image');
           article.classList.add('no-image');
         }
+      }
+    }, true);
+
+    // 文章列表滚动到底部时加载下一页。scroll 不冒泡，且列表容器每次渲染都会重建，
+    // 故在 document 捕获阶段统一委托（与上面的 error 委托同一惯例）。
+    document.addEventListener('scroll', (e) => {
+      const container = e.target;
+      if (!(container instanceof HTMLElement)) return;
+      if (!container.classList.contains('sa-feed-article-list')) return;
+      if (container.scrollTop + container.clientHeight >= container.scrollHeight - 200) {
+        loadNextArticlePage();
       }
     }, true);
 
@@ -542,20 +582,41 @@
     // 显示加载占位
     content.appendChild(buildLoading());
 
+    // 重渲染前记住已加载范围与滚动位置：标记已读/加星都会写 rss_items_*，
+    // storage.onChanged 在本窗口同样触发重渲染。视图没变就应当恢复原状，
+    // 否则读一篇文章会让已翻的页数全部丢弃、滚动回到顶部。
+    const nextViewKey = currentArticleViewKey();
+    const sameView = nextViewKey === articleViewKey;
+    const previousList = el.querySelector('.sa-feed-article-list');
+    const preservedScrollTop = sameView && previousList ? previousList.scrollTop : 0;
+    const preservedCount = sameView ? articleLoadedCount : 0;
+
     // 一次性替换 DOM
     el.innerHTML = '';
     el.appendChild(wrapper);
 
+    // 作废尚未返回的分页请求（视图切换或本次重渲染之前发出的）
+    const token = ++articlePageToken;
+    articleViewKey = nextViewKey;
+    articleLoadedCount = 0;
+    articleTotalCount = 0;
+    isLoadingArticlePage = false;
+    articleCursor = null;
+    renderedArticleIds = new Set();
+
     try {
-      // "全部订阅"视图：卡片概览模式
+      // "全部订阅"视图：卡片概览模式。
+      // 每个源只取最新若干条 + 总数，不再把全部历史条目传到前台（累积模式下会无上限增长）。
       if (currentView === 'all') {
         content.className = 'sa-feed-overview';
-        const allResp = await send('rssGetItems', {});
-        const allItems = allResp && allResp.success ? allResp.items : [];
-        currentItems = allItems;
+        const resp = await send('rssGetFeedOverview', { limitPerFeed: OVERVIEW_ITEMS_PER_FEED });
+        if (token !== articlePageToken) return;
+        const overview = resp && resp.success ? (resp.overview || []) : [];
+        // currentItems 供"标记全部已读"等操作使用；此处只含预览条目，
+        // 而 all 视图的标记已读走 rssMarkAllFeedsRead（后台整源处理），不依赖它的完整性。
+        currentItems = overview.flatMap((entry) => entry.items || []);
 
-        // 更新头部未读数
-        const unreadCount = allItems.filter((i) => !i.read).length;
+        const unreadCount = overview.reduce((sum, entry) => sum + (entry.unread || 0), 0);
         const unreadEl = header.querySelector('.sa-feed-header-unread');
         if (unreadEl) unreadEl.textContent = t('rssTotalUnread', [unreadCount]);
 
@@ -563,16 +624,17 @@
         if (feeds.length === 0) {
           content.appendChild(buildEmpty());
         } else {
-          content.appendChild(buildFeedOverviewCards(allItems));
+          content.appendChild(buildFeedOverviewCards(overview));
         }
         return;
       }
 
-      // "已加星"视图：按卡片标题分组展示
+      // "已加星"视图：按卡片标题分组展示。过滤在后台完成，只回传星标条目。
       if (currentView === 'starred') {
         content.className = 'sa-feed-overview';
-        const allResp = await send('rssGetItems', {});
-        const starredItems = allResp && allResp.success ? allResp.items.filter((i) => i.starred) : [];
+        const resp = await send('rssGetStarredItems', {});
+        if (token !== articlePageToken) return;
+        const starredItems = resp && resp.success ? (resp.items || []) : [];
         currentItems = starredItems;
 
         // 更新头部统计
@@ -589,39 +651,125 @@
         return;
       }
 
-      // 单个 feed 视图
-      let items = [];
-      {
-        const resp = await send('rssGetItems', { feedId: currentView });
-        items = resp && resp.success ? resp.items : [];
-      }
+      // 单个 feed 视图：只取第一页，其余随滚动增量加载。
+      // 排序与未读过滤都在后台完成（后台按 publishedAt || fetchedAt 倒序，
+      // 比原来只看 publishedAt 更稳：无日期条目不会全部堆到末尾）。
+      // 同一视图重渲染时按已加载条数取回（不足一页则按一页），保证不会塌回第一页
+      const restoreLimit = Math.max(ARTICLE_PAGE_SIZE, preservedCount);
+      const resp = await send('rssGetItemsPage', {
+        feedId: currentView,
+        offset: 0,
+        limit: restoreLimit,
+        unreadOnly: showUnreadOnly,
+      });
+      if (token !== articlePageToken) return;
+      const page = resp && resp.success ? resp : { items: [], total: 0, unreadTotal: 0 };
+      const items = page.items || [];
 
       currentItems = items;
-
-      // 过滤未读
-      let display = showUnreadOnly ? items.filter((i) => !i.read) : items;
-      // 排序：最新在前
-      display = [...display].sort((a, b) => (b.publishedAt || 0) - (a.publishedAt || 0));
+      articleLoadedCount = items.length;
+      articleTotalCount = Number(page.total) || 0;
+      articleCursor = itemCursor(items[items.length - 1]);
+      renderedArticleIds = new Set(items.map((i) => i.id));
 
       content.innerHTML = '';
-      if (display.length === 0) {
+      if (items.length === 0) {
         content.appendChild(buildEmpty());
       } else {
         // 更新头部未读数
-        const unreadCount = items.filter((i) => !i.read).length;
         const unreadEl = header.querySelector('.sa-feed-header-unread');
-        if (unreadEl) unreadEl.textContent = t('rssTotalUnread', [unreadCount]);
+        if (unreadEl) unreadEl.textContent = t('rssTotalUnread', [Number(page.unreadTotal) || 0]);
 
         const frag = document.createDocumentFragment();
-        for (const item of display) {
+        for (const item of items) {
           frag.appendChild(buildArticleCard(item));
         }
         content.appendChild(frag);
+        syncArticleSentinel(content);
+        // 恢复滚动位置（DOM 已重建，需等本帧布局完成）
+        if (preservedScrollTop > 0) {
+          requestAnimationFrame(() => {
+            if (token === articlePageToken) content.scrollTop = preservedScrollTop;
+          });
+        }
       }
     } catch (err) {
       console.error('RSS render failed:', err);
       content.innerHTML = '';
       content.appendChild(buildError(err.message));
+    }
+  }
+
+  // 维护列表底部的"加载更多"哨兵：还有未加载条目时保留，加载完毕后移除。
+  // 与时间轴视图（standalone.js）用同一套 scroll + 哨兵惯例，不引入新机制。
+  function syncArticleSentinel(content) {
+    const existing = content.querySelector('.sa-load-more-sentinel');
+    if (articleLoadedCount >= articleTotalCount) {
+      if (existing) existing.remove();
+      return;
+    }
+    if (existing) {
+      content.appendChild(existing); // 保持在末尾
+      return;
+    }
+    const sentinel = document.createElement('div');
+    sentinel.className = 'sa-load-more-sentinel';
+    sentinel.innerHTML = '<div class="sa-loading-dots"><span></span><span></span><span></span></div>';
+    content.appendChild(sentinel);
+  }
+
+  // 追加下一页文章。仅单 feed 视图有分页（overview/starred 是有界卡片视图）。
+  async function loadNextArticlePage() {
+    if (isLoadingArticlePage) return;
+    if (currentView === 'all' || currentView === 'starred') return;
+    if (articleLoadedCount >= articleTotalCount) return;
+
+    const el = getFeedViewEl();
+    const content = el && el.querySelector('.sa-feed-article-list');
+    if (!content) return;
+
+    const token = articlePageToken;
+    isLoadingArticlePage = true;
+    try {
+      // 用游标而非 offset：翻页期间数据集会变（读掉一篇导致未读数组前移、
+      // 轮询写入新文章导致整体后移），位置基准会漏条或重复，内容基准不会。
+      const resp = await send('rssGetItemsPage', {
+        feedId: currentView,
+        cursor: articleCursor,
+        offset: articleLoadedCount, // 无游标时（理论上不会发生）的兜底
+        limit: ARTICLE_PAGE_SIZE,
+        unreadOnly: showUnreadOnly,
+      });
+      // 视图已切换或整页重渲染过：丢弃本次响应，避免把旧源的文章追加到新列表
+      if (token !== articlePageToken) return;
+      if (!resp || !resp.success) return;
+
+      articleTotalCount = Number(resp.total) || articleTotalCount;
+      // 去重兜底：游标已能避免重复，但源被并发改写时仍以"已渲染 id"为准，
+      // 防止出现重复卡片（重复 id 会让加星/存书签只更新第一张卡片）。
+      const items = (resp.items || []).filter((item) => !renderedArticleIds.has(item.id));
+      if (items.length === 0) {
+        articleLoadedCount = articleTotalCount; // 没有更多可追加的条目，停止继续请求
+        syncArticleSentinel(content);
+        return;
+      }
+
+      const frag = document.createDocumentFragment();
+      for (const item of items) {
+        currentItems.push(item);
+        renderedArticleIds.add(item.id);
+        frag.appendChild(buildArticleCard(item));
+      }
+      const sentinel = content.querySelector('.sa-load-more-sentinel');
+      if (sentinel) content.insertBefore(frag, sentinel);
+      else content.appendChild(frag);
+      articleLoadedCount += items.length;
+      articleCursor = itemCursor(items[items.length - 1]);
+      syncArticleSentinel(content);
+    } catch (err) {
+      console.warn('RSS load more failed:', err);
+    } finally {
+      if (token === articlePageToken) isLoadingArticlePage = false;
     }
   }
 
@@ -693,26 +841,26 @@
   }
 
   // ===== 全部订阅：订阅源卡片概览 =====
-  function buildFeedOverviewCards(allItems) {
+  // overview: [{ feedId, total, unread, items }]，items 已是后台按时间倒序切出的最新若干条。
+  // 卡片底部的"共 N 篇"取 entry.total（源的真实总数），而不是预览条目数。
+  function buildFeedOverviewCards(overview) {
     const container = document.createElement('div');
     container.className = 'sa-feed-overview-grid';
 
-    // 按 feedId 分组
-    const itemsByFeed = new Map();
-    for (const item of allItems) {
-      if (!itemsByFeed.has(item.feedId)) itemsByFeed.set(item.feedId, []);
-      itemsByFeed.get(item.feedId).push(item);
-    }
-    // 每个 feed 内按时间排序
-    for (const [, arr] of itemsByFeed) {
-      arr.sort((a, b) => (b.publishedAt || 0) - (a.publishedAt || 0));
+    const byFeed = new Map();
+    for (const entry of overview || []) {
+      byFeed.set(entry.feedId, entry);
     }
 
     // 按 feeds 数组顺序渲染（即用户自定义的拖拽顺序，与侧栏一致），
     // 让拖拽排序的结果在卡片网格中稳定生效
     for (const feed of feeds) {
-      const items = itemsByFeed.get(feed.id) || [];
-      container.appendChild(buildFeedOverviewCard(feed, items));
+      const entry = byFeed.get(feed.id);
+      container.appendChild(buildFeedOverviewCard(
+        feed,
+        entry?.items || [],
+        Number(entry?.total) || 0,
+      ));
     }
     return container;
   }
@@ -743,7 +891,9 @@
     return container;
   }
 
-  function buildFeedOverviewCard(feed, items) {
+  // items 可能只是预览切片（全部订阅视图），因此总数由 totalCount 显式传入；
+  // 省略时回退到 items.length，保持"已收藏"视图等调用方的原有语义。
+  function buildFeedOverviewCard(feed, items, totalCountOverride) {
     const card = document.createElement('div');
     card.className = 'sa-feed-overview-card';
     card.dataset.feedId = feed.id;
@@ -754,7 +904,7 @@
     const favicon = feed.favicon || (feed.siteUrl ? getFaviconForUrl(feed.siteUrl) : '');
     const unread = feedUnreadCounts.get(feed.id) || 0;
     const top5 = items.slice(0, 5);
-    const totalCount = items.length;
+    const totalCount = totalCountOverride === undefined ? items.length : totalCountOverride;
     const isStarredFeed = currentView === 'starred';
 
     // 卡片头部
@@ -1164,10 +1314,15 @@
       // 更新按钮 UI
       const card = getFeedViewEl().querySelector(`[data-item-id="${item.id}"]`);
       if (card) {
-        const btn = card.querySelector('[data-act="star"]');
-        btn.classList.toggle('starred', item.starred);
-        btn.innerHTML = item.starred ? SVG_STAR_FILL : SVG_STAR;
-        btn.title = item.starred ? t('rssUnstar') : t('rssStar');
+        // 两种卡片形态的星标按钮 data-act 不同：文章卡片是 star，概览/收藏卡片的预览行是
+        // star-item。属性选择器是精确等值匹配，只写 star 时概览视图会拿到 null 并抛
+        // TypeError（被 catch 吞掉），连同下面"取消星标即移除卡片"一起失效。
+        const btn = card.querySelector('[data-act="star"], [data-act="star-item"]');
+        if (btn) {
+          btn.classList.toggle('starred', item.starred);
+          btn.innerHTML = item.starred ? SVG_STAR_FILL : SVG_STAR;
+          btn.title = item.starred ? t('rssUnstar') : t('rssStar');
+        }
       }
       // 如果当前是已加星视图且取消加星，则移除该卡片
       if (currentView === 'starred' && !item.starred) {
@@ -1206,14 +1361,20 @@
       if (currentView === 'all') {
         await send('rssMarkAllFeedsRead', {});
       } else if (currentView === 'starred') {
-        // 仅标记当前可见的加星项
+        // 仅标记当前可见的加星项。starred 视图跨多个源，无法整源清零，
+        // 必须按实际标记成功的条目逐源扣减——否则侧栏与 Tab 徽标会停在旧数字。
         for (const item of currentItems.filter((i) => !i.read)) {
-          await send('rssSetItemRead', { itemId: item.id, feedId: item.feedId, read: true });
+          const resp = await send('rssSetItemRead', { itemId: item.id, feedId: item.feedId, read: true });
+          if (!resp || resp.success === false) continue;
+          item.read = true;
+          const cnt = feedUnreadCounts.get(item.feedId) || 0;
+          feedUnreadCounts.set(item.feedId, Math.max(0, cnt - 1));
         }
+        totalUnread = Array.from(feedUnreadCounts.values()).reduce((a, b) => a + b, 0);
       } else {
         await send('rssMarkAllRead', { feedId: currentView });
       }
-      // 重置未读计数
+      // 重置未读计数（starred 分支已在上面逐条扣减）
       if (currentView === 'all') {
         feedUnreadCounts.clear();
         totalUnread = 0;

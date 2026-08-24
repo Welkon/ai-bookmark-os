@@ -6862,9 +6862,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           return;
         }
         // 直接写入首批条目，避免二次拉取
+        let storedCount = null;
         if (init._parsed && init._parsed.items) {
           const settings = await FeedStore.getSettings();
-          await FeedStore.upsertItems(addResult.feed.id, init._parsed.items, settings.maxItemsPerFeed);
+          const added = await FeedStore.upsertItems(addResult.feed.id, init._parsed.items, settings.maxItemsPerFeed);
+          storedCount = Array.isArray(added) ? added.length : null;
           await FeedStore.updateFeed(addResult.feed.id, {
             lastFetched: Date.now(),
             etag: init.etag,
@@ -6874,7 +6876,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         FeedNotifier.updateBadge();
         // 先响应前端，不等 favicon
         const feedResult = addResult.feed;
-        sendResponse({ success: true, feed: feedResult, itemCount: init.itemCount || 0 });
+        // 报真实落库条数而非解析条数：源内 guid 重复等情况下两者会不一致，
+        // 用解析数会出现"提示订阅成功 N 篇、进列表只有 M 篇"的虚报。
+        sendResponse({
+          success: true,
+          feed: feedResult,
+          itemCount: storedCount === null ? (init.itemCount || 0) : storedCount,
+        });
         // favicon 异步补上（不阻塞订阅响应）
         if (init._faviconPromise) {
           init._faviconPromise.then(async (favicon) => {
@@ -6935,6 +6943,51 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           ? await FeedStore.getItems(message.feedId)
           : await FeedStore.getAllItems();
         sendResponse({ success: true, items });
+      })().catch((err) => sendResponse({ success: false, error: err?.message || 'rss_operation_failed' }));
+      return true;
+    }
+
+    // 以下三个查询是累积模式（maxItemsPerFeed=0）的配套：单个源可能积累数千条，
+    // 把整份历史经 sendMessage 结构化克隆回前台的开销会随时间无上限增长。
+    // rssGetItems 保留原语义不动，供旧调用方与导出等需要全量的场景使用。
+    case 'rssGetItemsPage': {
+      (async () => {
+        if (!message.feedId) {
+          sendResponse({ success: false, error: 'missing_feed_id' });
+          return;
+        }
+        const page = await FeedStore.getItemsPage(message.feedId, {
+          offset: message.offset,
+          limit: message.limit,
+          unreadOnly: message.unreadOnly === true,
+        });
+        sendResponse({ success: true, ...page });
+      })().catch((err) => sendResponse({ success: false, error: err?.message || 'rss_operation_failed' }));
+      return true;
+    }
+
+    case 'rssGetFeedOverview': {
+      (async () => {
+        const overview = await FeedStore.getFeedOverview(message.limitPerFeed);
+        sendResponse({ success: true, overview });
+      })().catch((err) => sendResponse({ success: false, error: err?.message || 'rss_operation_failed' }));
+      return true;
+    }
+
+    case 'rssGetStarredItems': {
+      (async () => {
+        const items = await FeedStore.getStarredItems();
+        sendResponse({ success: true, items });
+      })().catch((err) => sendResponse({ success: false, error: err?.message || 'rss_operation_failed' }));
+      return true;
+    }
+
+    // 只回一个未读总数：设置页徽标原先拉取全部条目再在前台 filter 计数，
+    // 累积模式下这份负载会随历史无上限增长。
+    case 'rssGetUnreadCount': {
+      (async () => {
+        const count = await FeedStore.getTotalUnreadCount();
+        sendResponse({ success: true, count });
       })().catch((err) => sendResponse({ success: false, error: err?.message || 'rss_operation_failed' }));
       return true;
     }
@@ -7624,9 +7677,11 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
         title: init.title || feedUrl,
         siteUrl: init.siteUrl
       });
+      let storedCount = null;
       if (addResult.success && init._parsed && init._parsed.items) {
         const settings = await FeedStore.getSettings();
-        await FeedStore.upsertItems(addResult.feed.id, init._parsed.items, settings.maxItemsPerFeed);
+        const added = await FeedStore.upsertItems(addResult.feed.id, init._parsed.items, settings.maxItemsPerFeed);
+        storedCount = Array.isArray(added) ? added.length : null;
         await FeedStore.updateFeed(addResult.feed.id, {
           lastFetched: Date.now(),
           etag: init.etag,
@@ -7634,11 +7689,12 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
         });
       }
       FeedNotifier.updateBadge();
+      // 与消息通道的订阅路径一致：报真实落库条数，避免虚报
       chrome.notifications?.create({
         type: 'basic',
         iconUrl: '../icons/icon48.png',
         title: 'AI Bookmark OS',
-        message: `订阅成功: ${init.title || feedUrl}（${init.itemCount || 0} 篇）`
+        message: `订阅成功: ${init.title || feedUrl}（${storedCount === null ? (init.itemCount || 0) : storedCount} 篇）`
       });
     } catch (err) {
       console.error('右键订阅失败:', err);
