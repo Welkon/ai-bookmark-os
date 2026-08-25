@@ -47,6 +47,22 @@ function waitForStorage(page, predicate, timeoutMs = 8000) {
   return page.waitForFunction(predicate, undefined, { timeout: timeoutMs });
 }
 
+// Playwright 的 locator.count() 不自动等待：紧跟在点击/evaluate 之后取值时，
+// 若渲染由 sendMessage 往返驱动，机器负载高时会取到中间态（实际数小于期望）。
+// 这里轮询到期望值再断言，超时后仍按普通断言报错（保留原有失败信息）。
+async function assertCountEventually(page, selector, expected, message) {
+  try {
+    await page.waitForFunction(
+      ({ sel, want }) => document.querySelectorAll(sel).length === want,
+      { sel: selector, want: expected },
+      { timeout: 8000 },
+    );
+  } catch {
+    // 落到下面的断言，产出实际值以便定位
+  }
+  assert.equal(await page.locator(selector).count(), expected, message);
+}
+
 async function assertNoHorizontalOverflow(page, label) {
   const dimensions = await page.evaluate(() => ({
     clientWidth: document.documentElement.clientWidth,
@@ -590,7 +606,8 @@ try {
     assert.deepEqual(batchResult.remainingFixtureReviewIds, []);
     assert.equal(batchResult.accepted, 2);
     await settings.locator('#viewLearningRecordsBtn').click();
-    assert.equal(await settings.locator('#learningFeedbackList .learning-feedback-item').count(), 4);
+    // 点击后经 sendMessage 往返再渲染，需等到 fixture 2 条 + 本次批量接受 2 条都落地
+    await assertCountEventually(settings, '#learningFeedbackList .learning-feedback-item', 4);
   const learningFeedbackText = await settings.locator('#learningFeedbackList').innerText();
   assert.match(learningFeedbackText, /rejected\.example[\s\S]*(拒绝|Rejected)/i);
   assert.match(learningFeedbackText, /cancelled\.example[\s\S]*(取消|Cancelled)/i);
@@ -664,20 +681,20 @@ try {
       assert.equal(await nextPage.isDisabled(), false, `${controlsId} next page must be enabled initially`);
       for (const pageSize of [20, 50, 100]) {
         await controls.locator('[data-role="page-size"]').selectOption(String(pageSize));
-        assert.equal(await settings.locator(itemSelector).count(), pageSize, `${controlsId} must support ${pageSize} records per page`);
+        await assertCountEventually(settings, itemSelector, pageSize, `${controlsId} must support ${pageSize} records per page`);
         assert.equal(await previousPage.isDisabled(), true, `${controlsId} page-size changes must reset to the first page`);
       }
       await nextPage.click();
-      assert.equal(await settings.locator(itemSelector).count(), 5, `${controlsId} must render the final partial page`);
+      await assertCountEventually(settings, itemSelector, 5, `${controlsId} must render the final partial page`);
       assert.equal(await previousPage.isDisabled(), false, `${controlsId} previous page must be enabled on the final page`);
       assert.equal(await nextPage.isDisabled(), true, `${controlsId} next page must be disabled on the final page`);
       await controls.locator('[data-role="search"]').fill(searchTerm);
-      assert.equal(await settings.locator(itemSelector).count(), 1, `${controlsId} search must filter the complete record set`);
+      await assertCountEventually(settings, itemSelector, 1, `${controlsId} search must filter the complete record set`);
       assert.match(await settings.locator(itemSelector).first().innerText(), new RegExp(searchTerm.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i'));
       assert.equal(await previousPage.isDisabled(), true, `${controlsId} search must reset to the first page`);
       assert.equal(await nextPage.isDisabled(), true, `${controlsId} single-result search must have no next page`);
       await controls.locator('[data-role="search"]').fill('record-that-does-not-exist');
-      assert.equal(await settings.locator(itemSelector).count(), 0, `${controlsId} must render an empty search result`);
+      await assertCountEventually(settings, itemSelector, 0, `${controlsId} must render an empty search result`);
       assert.match(await controls.locator('xpath=following-sibling::*[1]').innerText(), /没有匹配的记录|No matching records/i);
       await controls.locator('[data-role="search"]').fill('');
       await controls.locator('[data-role="page-size"]').selectOption('10');
