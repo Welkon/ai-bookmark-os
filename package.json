@@ -23,7 +23,8 @@
     "test:quick-bookmark": "node scripts/test-quick-bookmark.mjs",
     "test:regressions": "node scripts/test-regressions.mjs",
     "preview:check": "node scripts/verify-build.mjs",
-    "audit:project": "node scripts/audit-project.mjs"
+    "audit:project": "node scripts/audit-project.mjs",
+    "package:release": "node scripts/package-release.mjs"
   },
   "dependencies": {
     "lucide-react": "^0.468.0",

@@ -65,3 +65,5 @@ pnpm-debug.log*
 /*.zip
 .narrafork/
 .worktrees/
+/release/
+/release-assets/
