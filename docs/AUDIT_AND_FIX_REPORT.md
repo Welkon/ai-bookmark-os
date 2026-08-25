@@ -1,11 +1,11 @@
 # AI Bookmark OS 全量审查与修复报告
 
-- 报告日期：2026-08-22（第一~三轮）／2026-08-24（第四轮：复核 + 新一轮排查）／2026-08-25（第五轮：RSS 累积功能 + 全量审查）
+- 报告日期：2026-08-22（第一~三轮）／2026-08-24（第四轮：复核 + 新一轮排查）／2026-08-25（第五轮：RSS 累积功能 + 全量审查；第六轮：E2E 不稳定项定位 + 多浏览器适配）
 - 审查范围：全仓库（`src/core`、`src/sidepanel`、`src/bookmark-nav`、`src/timeline`、`scripts`、构建与清单配置）
 - 审查方法：多路静态审计（核心逻辑 / React UI / 原生时间线模块）→ 对每条发现逐条对照当前源码实证核验（剔除审计代理误报的过期项）→ 分组修复 → 每组修复配回归测试 → **变异验证测试有效性** → 全量门禁验证
 - 验证门禁：`npm test`（60 个测试文件）、`npm run typecheck`、`npm run build`、`npm run preview:check`、`node scripts/audit-project.mjs`、Playwright 真实浏览器 E2E（`scripts/e2e-extension.mjs`，加载重建后的 `dist/`）
 
-> 五轮修复合计：**第一轮 24 项**（功能闭环 / P1 交互 / 存储安全），**第二轮 14 项**（遗留项全部处置：12 项修复 + 2 项评估后判定不改），**第三轮 4 项**（用户反馈的主动学习链路：手工移动不自动学习 + “采用首选”报错滞留 + 批量程序性移动学习隔离），**第四轮 16 项**（复核前三轮修复 + 新排查：1 项 P0 XSS、2 项前三轮修复留下的时序漏洞、13 项 RSS/存储/权限缺陷），**第五轮 9 项**（RSS 累积保留新功能 + 该功能引入的 3 项分页回归 + 5 项既有缺陷）。第一~三轮已提交于 `b189936`，第四轮于 `95316cd`，第五轮见本轮提交。
+> 六轮合计：**第一轮 24 项**（功能闭环 / P1 交互 / 存储安全），**第二轮 14 项**（遗留项全部处置：12 项修复 + 2 项评估后判定不改），**第三轮 4 项**（用户反馈的主动学习链路：手工移动不自动学习 + “采用首选”报错滞留 + 批量程序性移动学习隔离），**第四轮 16 项**（复核前三轮修复 + 新排查：1 项 P0 XSS、2 项前三轮修复留下的时序漏洞、13 项 RSS/存储/权限缺陷），**第五轮 9 项**（RSS 累积保留新功能 + 该功能引入的 3 项分页回归 + 5 项既有缺陷），**第六轮**（E2E 不稳定项定位并修复 + Edge 真机验证 + Firefox 方案核查，详见第六节）。提交：第一~三轮 `b189936`，第四轮 `95316cd`，第五轮 `a64e119`，第六轮 `6d83c94`（E2E）与 `99fc408`（Edge）+ 本轮报告提交。
 
 ---
 
@@ -206,6 +206,80 @@ RSS 累积功能与本轮修复分两批做变异验证，全部通过：
 6. **`removeFeed` 仍非原子**：第四轮只把两次写入调整为"失败后可自愈"的顺序（先删分片再摘索引，失败只留空条目的 feed，下轮拉取自行补齐），并未实现真正的事务。Chrome storage 无多键原子写，根治需引入写前日志。
 7. **累积模式下 storage 读写粒度仍是整个分片**（第五轮新增）：`chrome.storage` 无法只读一页，`getItemsPage` 仍要把整个 `rss_items_<feedId>` 读进内存再切片。游标分页解决的是**跨进程传输体积**（sendMessage 的结构化克隆），不是磁盘读取量。单源累积到极大量级（数万条）时，后台单次读取的内存与 JSON 解析成本会显现。根治需按时间分片存储（如 `rss_items_<feedId>_<yyyymm>`），属存储结构改造，未在本轮做。
 8. **全量撤销的"目录清理失败"仍保留撤销记录**（第五轮评估后判定不改）：审计代理将其报为"记录永久卡死"，但 `test-full-replacement.mjs:321` 与 `test-regressions.mjs` 两处测试都明确断言该行为。复查后认定这是刻意设计而非缺陷——记录保留是为了让用户**先把自己放进 AI 目录的内容移走，再点一次撤销即可完成目录清理**，出口在用户手里。代价是撤销按钮在此期间持续可点且提示"恢复 0 条书签"，体验不佳但数据安全。改变它需要推翻两处既有测试契约，属产品决策，已在源码补注释说明，留待确认。
-9. **E2E 存在一处未定位的不稳定项**（第五轮如实记录）：本轮 4 次运行中有 1 次失败于**主动学习列表分页**断言（`actual: 4, expected: 5`），随后连续两次运行均通过。该区域与本轮 RSS/undo 改动无交集。残留输出中失败断言带 `generatedMessage: true`（表示未传自定义消息），而脚本内唯一期望 5 的断言（`e2e-extension.mjs:671`）是带自定义消息的，两者矛盾，因此**未能从残留输出可靠定位到具体断言行**，不排除是注入 105 条 UI 状态后有在飞的 `loadActiveLearning()` 落地将其冲掉的测试自身竞态（`actual: 4` 恰等于该测试早前断言的真实反馈条数）。此项未修，如实记录待复现后处理。
+9. ~~**E2E 存在一处未定位的不稳定项**~~ —— **第六轮已定位并修复**，详见第六节。根因是测试等待不足（Playwright 的 `locator.count()` 不自动等待），非产品缺陷。
 10. **E2E 浏览器版本**：本机 chromium 构建运行；标准 CI 环境执行 `npx playwright install` 后可直接跑官方链路。
 11. 第五轮改动（含 RSS 累积功能与本报告）见本轮提交；第四轮见 `95316cd`，前三轮见 `b189936`。
+
+---
+
+## 六、第六轮：E2E 不稳定项定位 + 多浏览器适配
+
+本轮不改动任何产品源码，只涉及测试与构建配置，因此无需重建 dist（`a64e119` 的产物仍然有效）。
+
+### 6.1 E2E 不稳定项：已定位并修复（第五轮残余风险第 9 项闭环）
+
+**根因**：Playwright 的 `locator.count()` **不自动等待**。脚本中有 6 处断言紧跟在"由 `sendMessage` 往返驱动渲染"的操作（`click` / `selectOption` / `fill` / `evaluate`）之后立刻取值，机器负载高时渲染尚未完成，取到中间态。
+
+**判定依据**（为何确认是测试而非产品缺陷）：
+- 所有观测到的失败都是**实际数 < 期望数**（`4<5`、`2<4`），没有一次是数值错误或多出条目；
+- **同一份 dist** 在通过与失败之间反复摆动（1 失败 → 2 通过 → 3 失败），期间无任何文件改动；
+- 失败集中在主动学习列表区域，与第五轮的 RSS / undo 改动无代码交集。
+
+**第五轮未能定位的原因**：当时误读了另一个测试套件（`test-regressions.mjs`）的残留输出文件，导致"失败断言带 `generatedMessage: true`，但脚本内唯一期望 5 的断言带自定义消息"这一矛盾无法解释。本轮改为把每次运行写入独立日志（`tmp/e2e-run-N.log`）后，立刻定位到 `e2e-extension.mjs:593`（`learningFeedbackList` 期望 4、实际 2）。
+
+**修复**：新增 `assertCountEventually(page, selector, expected, message)`——先用 `page.waitForFunction` 轮询到期望值，超时后仍走原断言以便产出实际值定位。应用于 6 处紧跟异步触发的计数断言（1 处学习记录 + 5 处分页）。**未改动**其余 35 处 `.count()` 断言（它们不跟在异步触发之后，改动无收益且扩大影响面）。
+
+**验证**：修复后连跑 3 次全部通过（`run1/2/3 EXIT=0`）。过程中我自己写错一次——助手定义为 `assertCountEventually` 但 3 处调用写成了 `waitForCount`，导致 3 次全崩于 `ReferenceError`；统一命名后通过。
+
+### 6.2 Microsoft Edge：无需任何代码改动，已真机验证
+
+新增 `scripts/e2e-edge.mjs`（`npm run test:edge`），用 Playwright 的 `channel: 'msedge'` 加载真实 Edge。**Edge 151.0.4129.107 实测全部通过**：
+
+| 验证项 | 结果 |
+|---|---|
+| 13 项 API 可用性 | 全部可用，含 `sidePanel`、`omnibox`、`favicon` 等 Chrome 专有项 |
+| `chrome.*` 是否返回 Promise | **是**（`chrome.storage.local.get({}).then` 为函数）——这是 429 处 `await chrome.*` 能在 Edge 上工作的前提 |
+| 6 个后台模块（14 处 `importScripts`） | 全部挂载到全局，SW 加载未中断 |
+| 书签增删查 + 存储往返 | 正常 |
+| 4 个扩展页面 | 打开无致命 console 错误 |
+| `_favicon/` 端点 | 可用（返回 32×32 图片） |
+
+**过程中的一次自查纠错**：首次探测 `_favicon` 报 `Failed to fetch`，我差点记成"Edge 不兼容"。实际是我从 `about:blank` 页发起 fetch、origin 不对；与 Chromium 对照后确认两者行为一致，修正探测方式后通过。**未经对照就下结论会在报告里留下错误的兼容性判断。**
+
+**Opera / Brave** 同为 Chromium 内核，且本项目未使用 `declarativeNetRequest` 与 `offscreen`（跨分支差异最大的两个 API），理论上同样可直接加载——但**未实测，不作保证**。
+
+### 6.3 Firefox：已完成事实核查与方案，按用户决定暂缓实施
+
+**本机无 Firefox，Playwright 也无 firefox 内核**（只有 chromium 各版本），因此无法自行验收。已向用户说明后按其决定搁置。以下核查结论留档，避免后续重复调研。
+
+**4 个真实阻塞点**（按严重程度）：
+
+| # | 阻塞点 | 用量 | 后果 |
+|---|---|---|---|
+| 1 | `await chrome.*` | **429 处** | Firefox 的 `chrome.*` 只支持回调、不返回 Promise（MDN 明确），全部拿到 `undefined` |
+| 2 | `chrome.omnibox` **裸调用无守卫** | 4 处 | Firefox 无 omnibox，顶层执行抛 TypeError → **整个后台脚本崩溃**，不是功能缺失而是全盘不可用 |
+| 3 | `importScripts` | 14 处 | Firefox 不支持 `background.service_worker`（[bug 1573659](https://bugzil.la/1573659)），事件页无 `importScripts` |
+| 4 | `chrome.sidePanel` | 19 处 | Firefox 用 `sidebar_action` + `sidebarAction`，与 `sidePanel` 是两套不兼容 API |
+
+**降低成本的两项有利事实**：
+- 3 和 4 的改造成本低于表面：14 个模块全为 `(function(global){...})(self)` 形式挂全局，`background.scripts` 数组按序加载到同一全局作用域，**语义与 importScripts 等价**；且同一份 manifest 可并列声明 `scripts` 与 `service_worker`——Chrome 取 SW、Firefox 取 scripts，**无需分叉源码**（MDN 明确支持该写法）。
+- 19 处 `sidePanel` 调用**已全部做特性检测**（`chrome.sidePanel?.`）并有回退到标签页的路径，Firefox 下不会崩，只是降级为开标签页。
+
+**其余降级项**：`_favicon/` 端点 4 处为 Chrome 专有（Firefox 下图标空，可降级为首字母色块）；`chrome.action.openPopup()` 2 处在 Firefox 上支持情况不同。
+
+**建议方案**：一份源码 + 一份构建脚本产出两个 dist（`dist/` 给 Chromium、`dist-firefox/` 给 Firefox），靠构建时生成不同 manifest + 一层薄适配层，不分叉源码。针对 429 处 `await chrome.*`，倾向**在所有入口最前注入 3 行 shim**：Firefox 下令 `globalThis.chrome` 指向 `globalThis.browser`（后者 Promise 风格且 API 兼容），Chromium 下空操作——429 处调用一行不改，不引入依赖。
+
+**该方案有一个未验证前提**：Firefox 扩展全局的 `chrome` 是否可写。无 Firefox 环境无法实测。若不可写，须退到官方 `webextension-polyfill` 路线（改 429 处为 `browser.*` 并打包 polyfill），工作量大一个量级。**实施前必须先验证这一点**，不能直接开工。
+
+**omnibox 守卫（阻塞点 2）本轮未改**：它是独立的健壮性问题，但只在非 Chromium 浏览器上才有价值；用户既已决定暂缓 Firefox，本轮不做超出该决定范围的改动。若后续启动 Firefox 适配，这是第一步。
+
+### 6.4 第六轮验证证据
+
+| 命令 | 结果 |
+|---|---|
+| `npm test` | All 60 test files passed（无新增测试，产品源码未动） |
+| `npm run test:e2e` | 连跑 3 次全部通过（修复前 3 次全失败） |
+| `npm run test:edge` | **Edge E2E passed**（Edge 151.0.4129.107，13 API / 6 模块 / 4 页面） |
+| dist | 未重建：本轮无产品源码改动，`a64e119` 的产物仍有效 |
+
+第六轮改动：`scripts/e2e-extension.mjs`（轮询等待助手 + 6 处断言）、新增 `scripts/e2e-edge.mjs`、`package.json`（`test:edge`）、本报告。提交见 `6d83c94`（E2E 修复）与 `99fc408`（Edge 验证）。
