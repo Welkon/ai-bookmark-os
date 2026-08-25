@@ -13,6 +13,7 @@
   "scripts": {
     "test": "node scripts/run-tests.mjs",
     "test:e2e": "node scripts/e2e-extension.mjs",
+    "test:e2e:edge": "node scripts/e2e-edge.mjs",
     "dev": "vite build --watch",
     "build:ai": "tsc -b && vite build",
     "build:ext": "node scripts/package-extension.mjs",
