@@ -233,7 +233,7 @@ RSS 累积功能与本轮修复分两批做变异验证，全部通过：
 
 ### 6.2 Microsoft Edge：无需任何代码改动，已真机验证
 
-新增 `scripts/e2e-edge.mjs`（`npm run test:edge`），用 Playwright 的 `channel: 'msedge'` 加载真实 Edge。**Edge 151.0.4129.107 实测全部通过**：
+新增 `scripts/e2e-edge.mjs`（`npm run test:e2e:edge`），用 Playwright 的 `channel: 'msedge'` 加载真实 Edge。**Edge 151.0.4129.107 实测全部通过**：
 
 | 验证项 | 结果 |
 |---|---|
@@ -279,7 +279,43 @@ RSS 累积功能与本轮修复分两批做变异验证，全部通过：
 |---|---|
 | `npm test` | All 60 test files passed（无新增测试，产品源码未动） |
 | `npm run test:e2e` | 连跑 3 次全部通过（修复前 3 次全失败） |
-| `npm run test:edge` | **Edge E2E passed**（Edge 151.0.4129.107，13 API / 6 模块 / 4 页面） |
+| `npm run test:e2e:edge` | **Edge E2E passed**（Edge 151.0.4129.107，13 API / 6 模块 / 4 页面） |
 | dist | 未重建：本轮无产品源码改动，`a64e119` 的产物仍有效 |
 
-第六轮改动：`scripts/e2e-extension.mjs`（轮询等待助手 + 6 处断言）、新增 `scripts/e2e-edge.mjs`、`package.json`（`test:edge`）、本报告。提交见 `6d83c94`（E2E 修复）与 `99fc408`（Edge 验证）。
+第六轮改动：`scripts/e2e-extension.mjs`（轮询等待助手 + 6 处断言）、新增 `scripts/e2e-edge.mjs`、`package.json`（`test:e2e:edge`）、本报告。提交见 `6d83c94`（E2E 修复）与 `99fc408`（Edge 验证）。
+
+---
+
+## 七、v1.0.10 发布
+
+1.0.9 之后的四~六轮改动（共 25 项修复 + RSS 累积保留新功能 + Edge 适配验证）合并为 1.0.10 发布。
+
+### 版本号变更
+
+`package.json`、`manifest.json`、`package-lock.json`（仅项目自身的两处 `version`，第 1253 行 `@types/estree` 的 `1.0.9` 是依赖版本，未动）。
+
+`src/core/changelog.ts` 追加 1.0.10 条目（升级后弹窗的数据源，中英各 5 条）。
+
+**版本比较的一处风险已实测排除**：`entriesSince` 用按段数字比较（`split('.').map(Number)`），`cmp('1.0.10','1.0.9') = 1` 正确。若该实现是字符串比较，`"1.0.10" < "1.0.9"` 会导致升级弹窗完全不出现——这类缺陷在发布后才会暴露。
+
+**一处既有测试被新条目打破并已修正**：`test-changelog-whatsnew.mjs` 原断言 `entriesSince('1.0.9','1.1.0').length === 0`（用于验证"CHANGELOG 未维护到目标版本时退回通用提示"）。加入 1.0.10 条目后该区间不再为空，改用确实为空的 `1.1.0 → 1.2.0` 区间，保留该用例原意；同时把 1.0.10 纳入"累积展示"用例，使新条目本身也有测试守护。
+
+### 发布验证证据
+
+| 命令 | 结果 |
+|---|---|
+| `npm run typecheck` | 通过（1.0.10） |
+| `npm test` | All 60 test files passed |
+| `npm run build` | 成功，`dist/manifest.json` 为 1.0.10 |
+| `npm run preview:check` | `VERIFY PASS` |
+| `npm run audit:project` | `PROJECT AUDIT PASS` |
+| dist 产物核验 | 15 项通过（含 P0 引号转义、RSS 累积默认值、游标分页、1.0.10 changelog 已打入 AI bundle） |
+| `npm run test:e2e` | 通过（真实 Chromium 加载 1.0.10 产物） |
+| `npm run test:e2e:edge` | 通过（真实 Edge 151.0.4129.107，`manifest v1.0.10`） |
+
+过程中我误用了不存在的脚本名 `npm run test:edge`（实际是 `test:e2e:edge`），一度把它当成"Edge 验证失败"。已核实为我的命令错误而非产品问题，并更正了第六节中三处错误的命令名。
+
+### 发布产物
+
+- `ai-bookmark-os-v1.0.10-chromium-extension.zip` —— 解压后可直接加载的扩展包（`manifest.json` 在压缩包根层）。改名为 `chromium` 是因为本版本已在真实 Edge 上验证通过，不再只面向 Chrome；Opera / Brave 同内核理论可用但未实测。
+- `ai-bookmark-os-v1.0.10-source.zip` —— 源码快照（`git archive` 自发布提交导出）。

@@ -9,6 +9,29 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: '1.0.10',
+    zh: [
+      'RSS 订阅默认累积保留全部历史文章，不再因新文章到来而删除旧文章',
+      '文章列表改为滚动增量加载，读完一篇不再跳回列表顶部',
+      '安全修复：恶意订阅源无法再通过文章图片地址在扩展页面注入脚本',
+      '修复加星文章被新文章挤掉后永久丢失，加星与已收藏的文章始终保留',
+      '修复订阅源解析问题：文章链接损坏、单个特殊字符导致订阅源永久失效、播客源标题错位',
+      '修复批量分类时把程序移动误当成手工归档来学习',
+      '撤销未完全成功时不再提示"已撤销"，改为明确告知需重试',
+      '已在 Microsoft Edge 上完成兼容性验证',
+    ],
+    en: [
+      'RSS feeds now keep the full history by default instead of evicting older articles',
+      'Article lists load incrementally on scroll and no longer jump back to the top after reading',
+      'Security fix: a hostile feed can no longer inject script through an article image URL',
+      'Starred and saved articles are never evicted when new articles arrive',
+      'Feed parsing fixes: broken article links, a single character disabling a feed, podcast title mix-ups',
+      'Bulk classification moves are no longer learned as manual filing',
+      'A partially failed undo now reports that a retry is needed instead of showing success',
+      'Compatibility verified on Microsoft Edge',
+    ],
+  },
+  {
     version: '1.0.9',
     zh: [
       '时间线体验修复：日期分组、搜索渲染与分页纠正',
