@@ -282,17 +282,53 @@ function buildRequest(settings: Settings, messages: ChatMessage[], opts: ChatOpt
   };
 }
 
+/** 输出预算上限与加码次数：思考型模型把 max_tokens 全用在推理上时要能自动加码 */
+const AI_OUTPUT_BUDGET_FALLBACK = 16384;
+const AI_OUTPUT_BUDGET_CAP = 32768;
+const AI_OUTPUT_BUDGET_ESCALATIONS = 2;
+
+/** 各协议的输出预算字段位置不同：openai/anthropic 用 max_tokens，gemini 用 generationConfig.maxOutputTokens */
+function readOutputBudget(spec: RequestSpec): number {
+  const body = spec.body as
+    | { max_tokens?: number; maxOutputTokens?: number; generationConfig?: { maxOutputTokens?: number } }
+    | undefined;
+  const value = Number(body?.max_tokens ?? body?.maxOutputTokens ?? body?.generationConfig?.maxOutputTokens);
+  return Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+/** 空回复诊断：区分“推理吃光了预算”与“网关返回了空内容”，避免只报“返回内容为空”无从下手 */
+function describeEmptyReply(data: unknown, spec: RequestSpec): string {
+  const payload = data as
+    | {
+        choices?: { finish_reason?: string }[];
+        usage?: { completion_tokens_details?: { reasoning_tokens?: number } };
+      }
+    | undefined;
+  const finishReason = payload?.choices?.[0]?.finish_reason;
+  const reasoningTokens = Number(payload?.usage?.completion_tokens_details?.reasoning_tokens) || 0;
+  const budgetTokens = readOutputBudget(spec);
+  if (finishReason === 'length' && reasoningTokens > 0) {
+    return `推理模型的思考用尽了输出预算（reasoning_tokens=${reasoningTokens}，max_tokens=${budgetTokens || '默认'}），没有返回正文`;
+  }
+  if (finishReason === 'length') {
+    return `模型输出被截断（max_tokens=${budgetTokens || '默认'}），没有返回正文`;
+  }
+  return 'API 返回内容为空';
+}
+
 /** 调用 LLM，带 429/5xx 指数退避重试 */
 export async function chat(
   settings: Settings,
   messages: ChatMessage[],
   opts: ChatOptions = {},
 ): Promise<string> {
-  const spec = buildRequest(settings, messages, opts);
+  let spec = buildRequest(settings, messages, opts);
   const maxRetries = getAiRetryCount(settings);
   const timeoutMs = getAiRequestTimeoutMs(settings);
   let lastError: Error = new Error('未知错误');
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+  let budgetEscalations = 0;
+  // 预算加码不占用网络重试次数：每加码一次就多允许一轮请求。
+  for (let attempt = 0; attempt <= maxRetries + budgetEscalations; attempt++) {
     try {
       const res = await fetchWithTimeout(spec.url, {
         method: 'POST',
@@ -337,7 +373,30 @@ export async function chat(
             (data as any)?.response,
         );
       }
-      if (!content) throw new Error('API 返回内容为空');
+      if (!content) {
+        // 推理模型（deepseek-flash / deepseek-reasoner / o 系列等）的思考同样计入 max_tokens：
+        // 预算被思考吃光时 finish_reason=length、content 为空而 reasoning_content 有内容。
+        // 这不是网关故障，加码输出预算重试比直接报“返回内容为空”有用。
+        const reason = describeEmptyReply(data, spec);
+        const budget = readOutputBudget(spec);
+        const nextBudget = budget > 0 ? budget * 2 : AI_OUTPUT_BUDGET_FALLBACK;
+        if (
+          budgetEscalations < AI_OUTPUT_BUDGET_ESCALATIONS &&
+          nextBudget <= AI_OUTPUT_BUDGET_CAP &&
+          nextBudget !== budget
+        ) {
+          budgetEscalations += 1;
+          spec = buildRequest(settings, messages, { ...opts, maxTokens: nextBudget });
+          opts.onRetry?.({
+            attempt: budgetEscalations,
+            maxRetries: AI_OUTPUT_BUDGET_ESCALATIONS,
+            delayMs: 0,
+            reason: `${reason}，提高 max_tokens 到 ${nextBudget} 重试`,
+          });
+          continue;
+        }
+        throw new Error(reason);
+      }
       return content;
     } catch (e) {
       if (opts.signal?.aborted) throw e;
@@ -508,8 +567,10 @@ export function extractJson<T>(text: string): T {
 
 /** 测试 API 连接 */
 export async function testConnection(settings: Settings): Promise<string> {
+  // 推理模型的思考也消耗 max_tokens，预算过小时只会返回空的 content；
+  // 这里给一个够用的探测预算，真有截断再由 chat() 自动加码。
   return chat(settings, [{ role: 'user', content: '回复"OK"两个字母即可。' }], {
-    maxTokens: 16,
+    maxTokens: 512,
   });
 }
 

@@ -246,10 +246,12 @@ async function testLabelingUsesTheSameSignatureAsEstimate() {
   globalThis.fetch = async (_url, options) => {
     const request = JSON.parse(options.body);
     requests.push(request);
-    if (request.max_tokens === 8192 && requests.length === 1) {
+    // 按提示词内容区分阶段：预算（max_tokens）会随推理模型加码而变化，不能再作为阶段特征。
+    const userText = String(request.messages?.[1]?.content ?? '');
+    if (userText.startsWith('分析以下书签')) {
       throw new Error('标签缓存未命中：labelBookmarks 与 estimateClassify 未使用同一输入签名');
     }
-    const content = request.max_tokens === 4096
+    const content = userText.startsWith('根据以下书签信号生成分类树')
       ? JSON.stringify([{ name: '前端' }])
       : JSON.stringify([{ id: bookmark.id, cat: 0 }]);
     return {
@@ -267,7 +269,11 @@ async function testLabelingUsesTheSameSignatureAsEstimate() {
     tags: ['frontend'],
   });
   assert.equal(requests.length, 2, '缓存命中时仅应请求建树和分配两个 AI 阶段');
-  assert.equal(requests[0].max_tokens, 4096, '首个 AI 请求必须是建树，而不是重新打标签');
+  assert.match(
+    String(requests[0].messages?.[1]?.content ?? ''),
+    /^根据以下书签信号生成分类树/,
+    '首个 AI 请求必须是建树，而不是重新打标签',
+  );
 }
 
 async function testIncompleteSplitDoesNotPersistDraft() {

@@ -798,7 +798,9 @@ async function buildTree(
         ],
         {
           signal,
-          maxTokens: 4096,
+          // 建树是最费推理的一步：4096 时 deepseek-flash 等思考型模型会把预算全用在 reasoning 上，
+          // content 返回空。给到各供应商都接受的 8192，仍不够时由 chat() 自动继续加码。
+          maxTokens: 8192,
           onRetry: (info) =>
             onProgress({
               phase: 'building',
