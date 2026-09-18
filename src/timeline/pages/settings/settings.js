@@ -2491,6 +2491,9 @@ function parseTreeTestResponse(style, payloadText) {
       }
     } else {
       sample = String(data?.choices?.[0]?.message?.content || data?.choices?.[0]?.text || '').trim();
+      // 推理模型（deepseek-flash / deepseek-reasoner 等）在小 token 预算下会把额度全部用在
+      // reasoning_content 上，content 为空；这仍然说明端点、密钥与模型可用，不应误报不兼容。
+      if (!sample) sample = String(data?.choices?.[0]?.message?.reasoning_content || '').trim();
     }
     if (!sample) return { ok: false, error: `响应不符合 ${style} 协议或未包含回复内容` };
     return { ok: true, sample };
