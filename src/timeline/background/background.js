@@ -1385,13 +1385,29 @@ function isSafeExternalUrl(value) {
  * CORS 预检（OPTIONS），从根本上消除扩展页面直接 fetch 的"慢/报错"问题。
  * 仅接受 https/http 的 POST；返回 { ok, status, text }，解析仍由调用方负责。
  */
+/**
+ * 归一化调用方传来的请求头：大小写不敏感去重。
+ * 调用方可能传 'content-type'，而这里再补一个 'Content-Type'，Fetch 规范会把两个
+ * 同名头合并成 "application/json, application/json"；严格校验该头的服务端（DeepSeek 等）
+ * 会因此返回 415 "Expected request with `Content-Type: application/json`"。
+ */
+function normalizeAiProxyHeaders(headers) {
+  const normalized = {};
+  if (!headers || typeof headers !== 'object') return normalized;
+  for (const [key, value] of Object.entries(headers)) {
+    if (value === undefined || value === null) continue;
+    normalized[String(key).toLowerCase()] = String(value);
+  }
+  return normalized;
+}
+
 async function aiProxyFetch(request) {
   if (!request || typeof request !== 'object') throw new Error('invalid_ai_request');
   const url = typeof request.url === 'string' ? request.url : '';
   if (!isSafeExternalUrl(url) || !/^https?:$/.test(new URL(url).protocol)) {
     throw new Error('invalid_ai_request_url');
   }
-  const headers = (request.headers && typeof request.headers === 'object') ? request.headers : {};
+  const headers = normalizeAiProxyHeaders(request.headers);
   const body = typeof request.body === 'string' ? request.body : '';
   const timeoutMs = Math.min(600000, Math.max(1000, Number(request.timeoutMs) || 90000));
 
@@ -1401,7 +1417,8 @@ async function aiProxyFetch(request) {
   try {
     const resp = await fetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...headers },
+      // 统一小写键，保证与调用方传入的头只保留一份。
+      headers: { 'content-type': 'application/json', ...headers },
       body,
       signal: controller.signal,
     });

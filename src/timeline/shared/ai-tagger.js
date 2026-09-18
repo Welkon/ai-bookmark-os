@@ -803,6 +803,21 @@ function shouldTriggerAI(candidateTags, signals) {
 }
 
 // ===== 统一 API 调用 =====
+/**
+ * 归一化请求头：大小写不敏感去重。
+ * 否则 { 'Content-Type', 'content-type' } 会被 Fetch 合并成 "application/json, application/json"，
+ * 严格校验 content-type 的服务端（DeepSeek 等）会直接回 415。
+ */
+function normalizeAiRequestHeaders(headers) {
+  const normalized = {};
+  if (!headers || typeof headers !== 'object') return normalized;
+  for (const [key, value] of Object.entries(headers)) {
+    if (value === undefined || value === null) continue;
+    normalized[String(key).toLowerCase()] = String(value);
+  }
+  return normalized;
+}
+
 async function _doFetch(endpoint, headers, body, timeoutMs) {
   const controller = new AbortController();
   let timedOut = false;
@@ -813,7 +828,8 @@ async function _doFetch(endpoint, headers, body, timeoutMs) {
   try {
     const resp = await fetch(endpoint, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...headers },
+      // 统一小写键，避免与调用方传入的 content-type 重复。
+      headers: { 'content-type': 'application/json', ...normalizeAiRequestHeaders(headers) },
       body: JSON.stringify(body),
       signal: controller.signal
     });
